@@ -2,7 +2,13 @@
 
 #####################################################
 # Скрипт автоматической настройки Remnawave Node
-# Включает: системные обновления, NetBird, Docker
+# Включает: системные обновления, NetBird, Docker,
+#           мониторинг (cAdvisor, Node Exporter, vmagent),
+#           настройку UFW Firewall
+#
+# Поддерживает запуск через pipe благодаря /dev/tty:
+#   curl ... | sudo bash
+#   sudo bash <(curl ...)
 #####################################################
 
 set -e  # Остановить выполнение при любой ошибке
@@ -66,7 +72,7 @@ ask_monitoring_params() {
     
     # Запрашиваем NetBird Setup Key
     while [[ -z "$NETBIRD_SETUP_KEY" ]]; do
-        read -p "$(echo -e ${YELLOW}Введите NetBird Setup Key ${GREEN}\(получить в панели NetBird\)${NC}: )" NETBIRD_SETUP_KEY
+        read -p "$(echo -e ${YELLOW}Введите NetBird Setup Key ${GREEN}\(получить в панели NetBird\)${NC}: )" NETBIRD_SETUP_KEY < /dev/tty
         if [[ -z "$NETBIRD_SETUP_KEY" ]]; then
             echo -e "${RED}NetBird Setup Key не может быть пустым!${NC}"
         fi
@@ -74,7 +80,7 @@ ask_monitoring_params() {
     
     # Запрашиваем название инстанса
     while [[ -z "$INSTANCE_NAME" ]]; do
-        read -p "$(echo -e ${YELLOW}Введите название инстанса/сервера ${GREEN}\(например: de-node-01\)${NC}: )" INSTANCE_NAME
+        read -p "$(echo -e ${YELLOW}Введите название инстанса/сервера ${GREEN}\(например: de-node-01\)${NC}: )" INSTANCE_NAME < /dev/tty
         if [[ -z "$INSTANCE_NAME" ]]; then
             echo -e "${RED}Название инстанса не может быть пустым!${NC}"
         fi
@@ -82,14 +88,14 @@ ask_monitoring_params() {
     
     # Запрашиваем URL Victoria Metrics
     while [[ -z "$VICTORIA_METRICS_URL" ]]; do
-        read -p "$(echo -e ${YELLOW}Введите URL Victoria Metrics ${GREEN}\(например: http://10.0.0.1:8428\)${NC}: )" VICTORIA_METRICS_URL
+        read -p "$(echo -e ${YELLOW}Введите URL Victoria Metrics ${GREEN}\(например: http://10.0.0.1:8428\)${NC}: )" VICTORIA_METRICS_URL < /dev/tty
         if [[ -z "$VICTORIA_METRICS_URL" ]]; then
             echo -e "${RED}URL Victoria Metrics не может быть пустым!${NC}"
         fi
     done
     
     # Запрашиваем порт ноды для связи с панелью
-    read -p "$(echo -e ${YELLOW}Введите NODE_PORT для связи с панелью ${GREEN}\(по умолчанию: 2222\)${NC}: )" node_port_input
+    read -p "$(echo -e ${YELLOW}Введите NODE_PORT для связи с панелью ${GREEN}\(по умолчанию: 2222\)${NC}: )" node_port_input < /dev/tty
     if [[ -z "$node_port_input" ]]; then
         NODE_PORT="2222"
         log_info "Используется порт по умолчанию: $NODE_PORT"
@@ -99,7 +105,7 @@ ask_monitoring_params() {
     
     # Запрашиваем IP панели Remnawave
     while [[ -z "$PANEL_IP" ]]; do
-        read -p "$(echo -e ${YELLOW}Введите IP адрес панели Remnawave ${GREEN}\(для настройки firewall\)${NC}: )" PANEL_IP
+        read -p "$(echo -e ${YELLOW}Введите IP адрес панели Remnawave ${GREEN}\(для настройки firewall\)${NC}: )" PANEL_IP < /dev/tty
         if [[ -z "$PANEL_IP" ]]; then
             echo -e "${RED}IP панели не может быть пустым!${NC}"
         fi
