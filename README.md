@@ -42,13 +42,7 @@
 curl -fsSL https://raw.githubusercontent.com/VAQYBIN/Remnawave-Node-Auto-Installer/main/setup_remnawave_node.sh | sudo bash
 ```
 
-### Вариант 2: Через process substitution (альтернатива)
-
-```bash
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/VAQYBIN/Remnawave-Node-Auto-Installer/main/setup_remnawave_node.sh)
-```
-
-### Вариант 3: Скачать и запустить (безопаснее)
+### Вариант 2: Скачать и запустить (безопаснее)
 
 ```bash
 # Скачать скрипт
@@ -62,7 +56,7 @@ chmod +x setup_remnawave_node.sh
 sudo ./setup_remnawave_node.sh
 ```
 
-### Вариант 4: Через wget
+### Вариант 3: Через wget
 
 ```bash
 # Одной командой
@@ -109,8 +103,9 @@ sudo ./check_monitoring_status.sh
 При запуске скрипт запросит:
 - **NetBird Setup Key** (получить в панели NetBird: https://app.netbird.io/)
 - **Название инстанса** (например: `de-node-01`, `ru-moscow-01`)
-- **URL Victoria Metrics** (например: `http://10.0.0.1:8428`)
+- **IP/URL Victoria Metrics** (например: `10.0.0.1` или `http://10.0.0.1:8428` - формат будет автоматически проверен)
 - **NODE_PORT для связи с панелью** (по умолчанию: `2222`)
+- **XRAY_PORT для входящих VPN подключений** (по умолчанию: `443`)
 - **IP адрес панели Remnawave** (для настройки firewall)
 
 ### Что настраивается автоматически:
