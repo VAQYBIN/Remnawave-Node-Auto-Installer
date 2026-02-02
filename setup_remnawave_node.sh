@@ -152,12 +152,44 @@ ask_monitoring_params() {
 # Шаг 1: Обновление системы
 update_system() {
     log "Шаг 1/4: Обновление системных пакетов..."
-    if apt update && apt upgrade -y >> "$LOG_FILE" 2>&1; then
-        log "✓ Система успешно обновлена"
+    
+    # Экспортируем переменную для неинтерактивного режима
+    export DEBIAN_FRONTEND=noninteractive
+    
+    # apt update
+    if apt update >> "$LOG_FILE" 2>&1; then
+        log_info "✓ Списки пакетов обновлены"
     else
-        log_error "Ошибка при обновлении системы"
+        log_error "Ошибка при обновлении списков пакетов"
         exit 1
     fi
+    
+    # Проверяем количество обновлений
+    local upgradable=$(apt list --upgradable 2>/dev/null | grep -c upgradable || echo "0")
+    
+    if [ "$upgradable" -gt 0 ]; then
+        log_warning "Найдено обновлений: $upgradable"
+        log_warning "Обновление может занять 10-30 минут (в зависимости от количества пакетов)..."
+        log_info "Прогресс установки показывается ниже:"
+        echo ""
+        
+        # apt upgrade с показом прогресса через tee
+        if apt upgrade -y \
+            -o Dpkg::Options::="--force-confdef" \
+            -o Dpkg::Options::="--force-confold" \
+            2>&1 < /dev/null | tee -a "$LOG_FILE"; then
+            echo ""
+            log "✓ Система успешно обновлена"
+        else
+            echo ""
+            log_warning "Обновление завершилось с предупреждениями, продолжаем..."
+        fi
+    else
+        log "✓ Система уже обновлена (нет доступных обновлений)"
+    fi
+    
+    # Возвращаем DEBIAN_FRONTEND к дефолтному значению
+    unset DEBIAN_FRONTEND
 }
 
 # Шаг 2: Установка NetBird
