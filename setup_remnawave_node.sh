@@ -36,6 +36,7 @@ INSTANCE_NAME=""
 VICTORIA_METRICS_URL=""
 NODE_PORT=""
 PANEL_IP=""
+XRAY_PORT=""
 
 # Функция логирования
 log() {
@@ -86,12 +87,30 @@ ask_monitoring_params() {
         fi
     done
     
-    # Запрашиваем URL Victoria Metrics
+    # Запрашиваем URL Victoria Metrics с валидацией формата
     while [[ -z "$VICTORIA_METRICS_URL" ]]; do
-        read -p "$(echo -e ${YELLOW}Введите URL Victoria Metrics ${GREEN}\(например: http://10.0.0.1:8428\)${NC}: )" VICTORIA_METRICS_URL < /dev/tty
-        if [[ -z "$VICTORIA_METRICS_URL" ]]; then
+        read -p "$(echo -e ${YELLOW}Введите IP/URL Victoria Metrics ${GREEN}\(например: 10.0.0.1 или http://10.0.0.1:8428\)${NC}: )" vm_input < /dev/tty
+        if [[ -z "$vm_input" ]]; then
             echo -e "${RED}URL Victoria Metrics не может быть пустым!${NC}"
+            continue
         fi
+        
+        # Проверяем и форматируем URL
+        if [[ "$vm_input" =~ ^https?:// ]]; then
+            # URL уже содержит протокол
+            if [[ "$vm_input" =~ :8428 ]]; then
+                # Протокол и порт уже есть
+                VICTORIA_METRICS_URL="$vm_input"
+            else
+                # Есть протокол, но нет порта - добавляем порт
+                VICTORIA_METRICS_URL="${vm_input}:8428"
+            fi
+        else
+            # Только IP или hostname - добавляем протокол и порт
+            VICTORIA_METRICS_URL="http://${vm_input}:8428"
+        fi
+        
+        log_info "Сформирован URL: $VICTORIA_METRICS_URL"
     done
     
     # Запрашиваем порт ноды для связи с панелью
@@ -101,6 +120,15 @@ ask_monitoring_params() {
         log_info "Используется порт по умолчанию: $NODE_PORT"
     else
         NODE_PORT="$node_port_input"
+    fi
+    
+    # Запрашиваем порт Xray
+    read -p "$(echo -e ${YELLOW}Введите XRAY_PORT для входящих подключений ${GREEN}\(по умолчанию: 443\)${NC}: )" xray_port_input < /dev/tty
+    if [[ -z "$xray_port_input" ]]; then
+        XRAY_PORT="443"
+        log_info "Используется порт по умолчанию для Xray: $XRAY_PORT"
+    else
+        XRAY_PORT="$xray_port_input"
     fi
     
     # Запрашиваем IP панели Remnawave
@@ -116,6 +144,7 @@ ask_monitoring_params() {
     log_info "Название инстанса: $INSTANCE_NAME"
     log_info "Victoria Metrics URL: $VICTORIA_METRICS_URL"
     log_info "NODE_PORT: $NODE_PORT"
+    log_info "XRAY_PORT: $XRAY_PORT"
     log_info "IP панели Remnawave: $PANEL_IP"
     echo ""
 }
@@ -461,6 +490,14 @@ configure_firewall() {
         exit 1
     fi
     
+    # Разрешаем XRAY_PORT для входящих VPN подключений
+    if ufw allow "$XRAY_PORT"/tcp comment "Xray incoming connections" >> "$LOG_FILE" 2>&1; then
+        log_info "✓ Разрешен порт $XRAY_PORT для Xray (входящие подключения)"
+    else
+        log_error "Ошибка при добавлении правила для Xray"
+        exit 1
+    fi
+    
     # Включаем UFW
     log_warning "Включаем UFW firewall..."
     echo "y" | ufw enable >> "$LOG_FILE" 2>&1
@@ -521,6 +558,7 @@ show_next_steps() {
     echo -e "   ✓ UFW Firewall активирован"
     echo -e "   ✓ Доступ разрешен: OpenSSH"
     echo -e "   ✓ Доступ с панели: $PANEL_IP → порт $NODE_PORT"
+    echo -e "   ✓ Порт Xray: $XRAY_PORT (входящие VPN подключения)"
     echo ""
     echo -e "${BLUE}Следующие шаги для завершения настройки Remnawave Node:${NC}"
     echo ""
