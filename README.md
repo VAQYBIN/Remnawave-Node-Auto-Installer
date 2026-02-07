@@ -36,34 +36,19 @@
 
 ## 🚀 Быстрый старт
 
-### Вариант 1: Одной командой через pipe (рекомендуется)
+### Вариант 1: Одной командой (рекомендуется)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/VAQYBIN/Remnawave-Node-Auto-Installer/main/setup_remnawave_node.sh | sudo bash
+bash <(curl git.new/remnawave-setup)
 ```
 
-### Вариант 2: Скачать и запустить (безопаснее)
+### Вариант 2: Скачать и запустить
 
 ```bash
 # Скачать скрипт
-curl -fsSL https://raw.githubusercontent.com/VAQYBIN/Remnawave-Node-Auto-Installer/main/setup_remnawave_node.sh -o setup_remnawave_node.sh
-
-# Просмотреть содержимое (опционально)
-less setup_remnawave_node.sh
+curl -fsSL git.new/remnawave-setup -o setup_remnawave_node.sh
 
 # Сделать исполняемым и запустить
-chmod +x setup_remnawave_node.sh
-sudo ./setup_remnawave_node.sh
-```
-
-### Вариант 3: Через wget
-
-```bash
-# Одной командой
-wget -qO- https://raw.githubusercontent.com/VAQYBIN/Remnawave-Node-Auto-Installer/main/setup_remnawave_node.sh | sudo bash
-
-# Или скачать и запустить
-wget https://raw.githubusercontent.com/VAQYBIN/Remnawave-Node-Auto-Installer/main/setup_remnawave_node.sh
 chmod +x setup_remnawave_node.sh
 sudo ./setup_remnawave_node.sh
 ```
