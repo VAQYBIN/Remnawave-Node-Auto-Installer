@@ -259,44 +259,73 @@ ask_params() {
 # ─────────────────────────────────────────────────
 # Ожидание освобождения блокировки APT/dpkg
 #
-# Ubuntu автоматически запускает unattended-upgrades и apt-daily
-# при старте системы. Они держат /var/lib/dpkg/lock-frontend и
-# /var/lib/apt/lists/lock. Если наш скрипт стартует параллельно
-# с этими службами, любой вызов apt упадёт с ошибкой
-# "Could not get lock ... is another process using it?"
+# Ubuntu при старте автоматически запускает unattended-upgrades
+# и apt-daily — фоновые службы обновления безопасности. На свежих
+# серверах они могут держать блокировку 5–15 минут. Простое
+# пассивное ожидание ненадёжно: мы не знаем заранее, сколько
+# ждать. Поэтому функция сначала корректно останавливает эти
+# службы через systemd, а уже потом ждёт освобождения лока
+# (на случай если dpkg сам по себе ещё доделывает транзакцию).
 #
-# Функция проверяет оба лока и ждёт их освобождения (максимум
-# MAX_WAIT секунд). Вызывается перед каждым обращением к apt.
+# Важно: мы используем `systemctl stop`, а не `kill -9`. Принудительное
+# убийство dpkg в середине транзакции может сломать базу пакетов.
 # ─────────────────────────────────────────────────
 wait_for_apt_lock() {
-    local max_wait=120   # максимум 2 минуты
+    local max_wait=60    # после остановки служб ждём не более 60с
     local waited=0
     local sleep_interval=3
 
-    # Два файла блокировки: dpkg (пакетная база) и apt (списки)
+    # Службы, которые чаще всего держат APT-блокировку на Ubuntu
+    local blocking_services=(
+        "unattended-upgrades"
+        "apt-daily.service"
+        "apt-daily-upgrade.service"
+    )
+
+    # Шаг 1: останавливаем фоновые apt-службы через systemd.
+    # Это безопасно — systemd дождётся корректного завершения
+    # текущей операции внутри службы перед тем как её остановить.
+    local stopped_any=0
+    for svc in "${blocking_services[@]}"; do
+        set +e
+        systemctl is-active --quiet "$svc" 2>/dev/null
+        local is_active=$?
+        set -e
+
+        if (( is_active == 0 )); then
+            log_warning "Останавливаем $svc (он держит APT-блокировку)..."
+            # --no-block не нужен: мы хотим именно дождаться остановки
+            systemctl stop "$svc" >> "$LOG_FILE" 2>&1 || true
+            log_info "✓ $svc остановлен"
+            stopped_any=1
+        fi
+    done
+
+    if (( stopped_any == 1 )); then
+        log_info "Фоновые APT-службы остановлены. Ждём освобождения блокировки dpkg..."
+    fi
+
+    # Шаг 2: ждём пока dpkg сам отпустит файловый лок.
+    # После остановки служб это обычно занимает секунды, но
+    # может быть дольше если dpkg завершает транзакцию.
     local locks=("/var/lib/dpkg/lock-frontend" "/var/lib/apt/lists/lock")
 
     for lock in "${locks[@]}"; do
         while true; do
-            # fuser возвращает 0 если файл занят каким-либо процессом
             set +e
             fuser "$lock" > /dev/null 2>&1
             local locked=$?
             set -e
 
             if (( locked != 0 )); then
-                break  # лок свободен — идём дальше
+                break  # лок свободен
             fi
 
             if (( waited >= max_wait )); then
-                log_error "Таймаут: APT-блокировка не освободилась за ${max_wait}с"
-                log_error "Проверьте: lsof $lock"
+                log_error "Таймаут ${max_wait}с: APT-блокировка не освободилась"
+                log_error "Процесс, держащий лок: $(lsof $lock 2>/dev/null | tail -1)"
+                log_error "Попробуйте вручную: systemctl stop unattended-upgrades && sudo ./setup_remnawave_node.sh"
                 exit 1
-            fi
-
-            if (( waited == 0 )); then
-                log_warning "APT заблокирован другим процессом (unattended-upgrades?)"
-                log_warning "Ждём освобождения блокировки (максимум ${max_wait}с)..."
             fi
 
             sleep "$sleep_interval"
