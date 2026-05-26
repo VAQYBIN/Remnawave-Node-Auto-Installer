@@ -39,7 +39,7 @@
 ### Вариант 1: Одной командой (рекомендуется)
 
 ```bash
-bash <(curl git.new/remnawave-setup)
+bash <(curl -fsSL git.new/remnawave-setup)
 ```
 
 ### Вариант 2: Скачать и запустить
