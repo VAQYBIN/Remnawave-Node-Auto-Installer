@@ -257,12 +257,68 @@ ask_params() {
 }
 
 # ─────────────────────────────────────────────────
+# Ожидание освобождения блокировки APT/dpkg
+#
+# Ubuntu автоматически запускает unattended-upgrades и apt-daily
+# при старте системы. Они держат /var/lib/dpkg/lock-frontend и
+# /var/lib/apt/lists/lock. Если наш скрипт стартует параллельно
+# с этими службами, любой вызов apt упадёт с ошибкой
+# "Could not get lock ... is another process using it?"
+#
+# Функция проверяет оба лока и ждёт их освобождения (максимум
+# MAX_WAIT секунд). Вызывается перед каждым обращением к apt.
+# ─────────────────────────────────────────────────
+wait_for_apt_lock() {
+    local max_wait=120   # максимум 2 минуты
+    local waited=0
+    local sleep_interval=3
+
+    # Два файла блокировки: dpkg (пакетная база) и apt (списки)
+    local locks=("/var/lib/dpkg/lock-frontend" "/var/lib/apt/lists/lock")
+
+    for lock in "${locks[@]}"; do
+        while true; do
+            # fuser возвращает 0 если файл занят каким-либо процессом
+            set +e
+            fuser "$lock" > /dev/null 2>&1
+            local locked=$?
+            set -e
+
+            if (( locked != 0 )); then
+                break  # лок свободен — идём дальше
+            fi
+
+            if (( waited >= max_wait )); then
+                log_error "Таймаут: APT-блокировка не освободилась за ${max_wait}с"
+                log_error "Проверьте: lsof $lock"
+                exit 1
+            fi
+
+            if (( waited == 0 )); then
+                log_warning "APT заблокирован другим процессом (unattended-upgrades?)"
+                log_warning "Ждём освобождения блокировки (максимум ${max_wait}с)..."
+            fi
+
+            sleep "$sleep_interval"
+            (( waited += sleep_interval ))
+        done
+    done
+
+    if (( waited > 0 )); then
+        log_info "✓ APT-блокировка освободилась (ждали ${waited}с)"
+    fi
+}
+
+# ─────────────────────────────────────────────────
 # Шаг 1: Обновление системы
 # ─────────────────────────────────────────────────
 update_system() {
     log "Шаг 1/4: Обновление системных пакетов..."
 
     export DEBIAN_FRONTEND=noninteractive
+
+    # Ждём освобождения APT перед любым обращением к пакетному менеджеру
+    wait_for_apt_lock
 
     if ! apt update >> "$LOG_FILE" 2>&1; then
         log_error "Ошибка при обновлении списков пакетов"
@@ -350,6 +406,9 @@ setup_netbird() {
 # ─────────────────────────────────────────────────
 install_docker() {
     log "Шаг 4/4: Установка Docker..."
+
+    # Docker-инсталлятор (get.docker.com) тоже вызывает apt внутри — ждём лок
+    wait_for_apt_lock
 
     if command -v docker &> /dev/null; then
         local ver
@@ -871,6 +930,7 @@ services:
         hard: 1048576
     environment:
       - NODE_PORT=${NODE_PORT}
+      - XRAY_PORT=${XRAY_PORT}
       - SECRET_KEY=${secret_key}
     volumes:
       - /var/log/remnanode:/var/log/remnanode
