@@ -2,9 +2,19 @@
 
 #####################################################
 # Скрипт автоматической настройки Remnawave Node
-# Версия: 3.0
+# Версия: 3.1
 #
-# Улучшения по сравнению с v2.1:
+# Исправления в v3.1:
+#   - UFW больше не отрезает SSH на нестандартном порту:
+#     порты определяются автоматически и подтверждаются
+#   - NODE_PORT разрешается с NetBird IP панели, а не с
+#     публичного (панель ходит к ноде через mesh-сеть)
+#   - Детект APT-блокировки работает без пакета psmisc
+#   - Устойчивое определение версий бинарников мониторинга
+#   - Исправлен разбор статусов параллельных загрузок
+#   - Понятная ошибка при запуске без root
+#
+# Улучшения v3.0 по сравнению с v2.1:
 #   - Параллельная загрузка бинарников мониторинга
 #   - Автоопределение архитектуры (amd64/arm64)
 #   - Исправлена индентация YAML-конфигов
@@ -61,9 +71,14 @@ INSTANCE_NAME=""
 VICTORIA_METRICS_URL=""
 NODE_PORT=""
 XRAY_PORT=""
-PANEL_IP=""
+PANEL_NETBIRD_IP=""   # NetBird IP панели (100.x.x.x), а не публичный
 NETBIRD_IP=""
-ARCH_SUFFIX=""   # Определяется автоматически
+ARCH_SUFFIX=""        # Определяется автоматически
+SSH_PORTS=()          # Определяются автоматически перед включением UFW
+
+# Метод проверки APT-блокировки: "fuser" или "proc".
+# Выбирается один раз при первом обращении.
+LOCK_CHECK_METHOD=""
 
 # ─────────────────────────────────────────────────
 # Функции логирования
@@ -160,12 +175,58 @@ validate_port() {
 }
 
 # ─────────────────────────────────────────────────
+# Определение портов, на которых слушает SSH
+#
+# UFW с политикой "deny incoming" отрежет доступ к серверу,
+# если разрешить только профиль OpenSSH (порт 22), а sshd
+# слушает на нестандартном порту. Собираем порты из трёх
+# независимых источников и объединяем: лучше открыть лишний
+# порт, чем потерять управление сервером.
+#
+# Выводит найденные порты по одному на строку, отсортированные.
+# ─────────────────────────────────────────────────
+detect_ssh_ports() {
+    local -A found=()   # ассоциативный массив используется как множество
+    local port
+
+    # Источник 1: директивы Port в конфигах sshd.
+    # Директив может быть несколько (sshd слушает на всех перечисленных).
+    local cfg
+    for cfg in /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf; do
+        [[ -f "$cfg" ]] || continue
+        while read -r port; do
+            validate_port "$port" && found["$port"]=1
+        done < <(grep -ihsoP '^\s*Port\s+\K[0-9]+' "$cfg" 2>/dev/null || true)
+    done
+
+    # Источник 2: порт текущей SSH-сессии — самый достоверный признак,
+    # если скрипт запущен по SSH. Формат SSH_CONNECTION:
+    #   "<client_ip> <client_port> <server_ip> <server_port>"
+    if [[ -n "${SSH_CONNECTION:-}" ]]; then
+        port=$(awk '{print $4}' <<< "$SSH_CONNECTION")
+        validate_port "$port" && found["$port"]=1
+    fi
+
+    # Источник 3: фактически прослушиваемые sshd сокеты
+    if command -v ss &> /dev/null; then
+        while read -r port; do
+            validate_port "$port" && found["$port"]=1
+        done < <(ss -tlnp 2>/dev/null | grep -F 'sshd' | grep -oP ':\K[0-9]+(?=\s)' || true)
+    fi
+
+    # Fallback: ничего не нашли — считаем что порт стандартный
+    (( ${#found[@]} == 0 )) && found[22]=1
+
+    printf '%s\n' "${!found[@]}" | sort -n
+}
+
+# ─────────────────────────────────────────────────
 # Интерактивный сбор параметров
 # ─────────────────────────────────────────────────
 ask_params() {
     echo ""
     echo -e "${BLUE}╔════════════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BLUE}║         Настройка параметров Remnawave Node v3.0                   ║${NC}"
+    echo -e "${BLUE}║         Настройка параметров Remnawave Node v3.1                   ║${NC}"
     echo -e "${BLUE}╚════════════════════════════════════════════════════════════════════╝${NC}"
     echo ""
 
@@ -232,28 +293,105 @@ ask_params() {
         fi
     done
 
-    # IP панели Remnawave
+    # NetBird IP панели Remnawave
+    #
+    # Панель обращается к ноде через mesh-сеть, поэтому в правило UFW
+    # нужен именно NetBird-адрес панели (по умолчанию из 100.64.0.0/10),
+    # а не её публичный IP: с публичного адреса пакеты к ноде не придут.
+    # Посмотреть его можно в панели NetBird в списке пиров.
+    echo ""
+    echo -e "${CYAN}NetBird IP панели${NC} — адрес панели ${YELLOW}внутри mesh-сети${NC} (обычно 100.x.x.x),"
+    echo -e "а не её публичный IP. Найти: панель NetBird → Peers → строка сервера панели."
     while true; do
-        read -rp "$(echo -e "${YELLOW}IP адрес панели Remnawave${NC} (для правила UFW): ")" PANEL_IP < /dev/tty
+        read -rp "$(echo -e "${YELLOW}NetBird IP панели Remnawave${NC} (для правила UFW): ")" PANEL_NETBIRD_IP < /dev/tty
 
-        if [[ -z "$PANEL_IP" ]]; then
+        if [[ -z "$PANEL_NETBIRD_IP" ]]; then
             echo -e "${RED}Поле обязательно для заполнения${NC}"
-        elif validate_ip "$PANEL_IP"; then
-            break
+        elif ! validate_ip "$PANEL_NETBIRD_IP"; then
+            echo -e "${RED}Некорректный IPv4-адрес. Пример: 100.64.10.5${NC}"
         else
-            echo -e "${RED}Некорректный IPv4-адрес. Пример: 192.168.1.1${NC}"
+            # Мягкое предупреждение: пул NetBird можно переопределить,
+            # поэтому адрес вне 100.64.0.0/10 не считаем ошибкой.
+            # 100.64.0.0/10 — второй октет в диапазоне 64–127
+            if [[ ! "$PANEL_NETBIRD_IP" =~ ^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\. ]]; then
+                echo -e "${YELLOW}⚠ Адрес вне стандартного пула NetBird (100.64.0.0/10).${NC}"
+                echo -e "${YELLOW}  Убедитесь, что это адрес панели в mesh-сети, а не публичный IP.${NC}"
+            fi
+            break
         fi
     done
 
     echo ""
     echo -e "${CYAN}──────────────── Введённые параметры ────────────────${NC}"
     log_info "NetBird Setup Key: [СКРЫТ]"
-    log_info "Название инстанса:    $INSTANCE_NAME"
-    log_info "Victoria Metrics URL: $VICTORIA_METRICS_URL"
-    log_info "NODE_PORT:            $NODE_PORT"
-    log_info "XRAY_PORT:            $XRAY_PORT"
-    log_info "IP панели Remnawave:  $PANEL_IP"
+    log_info "Название инстанса:      $INSTANCE_NAME"
+    log_info "Victoria Metrics URL:   $VICTORIA_METRICS_URL"
+    log_info "NODE_PORT:              $NODE_PORT"
+    log_info "XRAY_PORT:              $XRAY_PORT"
+    log_info "NetBird IP панели:      $PANEL_NETBIRD_IP"
     echo ""
+}
+
+# ─────────────────────────────────────────────────
+# Определение доступного метода проверки блокировок
+#
+# fuser входит в пакет psmisc, которого нет на minimal-образах
+# Ubuntu/Debian и в контейнерах. Раньше его отсутствие давало
+# ненулевой код возврата, что трактовалось как "лок свободен" —
+# проверка молча вырождалась в заглушку. Теперь при отсутствии
+# fuser используется скан /proc/*/fd: чистый bash, без внешних
+# зависимостей.
+#
+# flock здесь не подходит: dpkg держит блокировку через
+# fcntl(F_SETLK), а flock(2) на Linux с ней не конфликтует,
+# поэтому такая проверка была бы ложноотрицательной.
+# ─────────────────────────────────────────────────
+detect_lock_check_method() {
+    if command -v fuser &> /dev/null; then
+        LOCK_CHECK_METHOD="fuser"
+    else
+        LOCK_CHECK_METHOD="proc"
+        log_warning "fuser не найден (пакет psmisc отсутствует)"
+        log_info "Проверяем APT-блокировку через скан /proc/*/fd"
+    fi
+}
+
+# ─────────────────────────────────────────────────
+# PID процессов, удерживающих открытым указанный файл
+# Выводит PID по одному на строку (пусто — файл никем не открыт)
+# ─────────────────────────────────────────────────
+lock_holders() {
+    local lock="$1"
+
+    [[ -e "$lock" ]] || return 0   # файла нет — держать нечего
+
+    if [[ "$LOCK_CHECK_METHOD" == "fuser" ]]; then
+        # fuser выводит PID через пробелы в stdout, диагностику — в stderr
+        fuser "$lock" 2>/dev/null | tr -s ' ' '\n' | grep -E '^[0-9]+$' || true
+        return 0
+    fi
+
+    # Скан /proc: ищем процессы, у которых открыт дескриптор на этот файл.
+    # Сравниваем цель символьной ссылки с путём лока — apt и dpkg
+    # открывают его по каноническому абсолютному пути.
+    local fd_path link pid
+    for fd_path in /proc/[0-9]*/fd/*; do
+        link=$(readlink "$fd_path" 2>/dev/null) || continue
+        [[ "$link" == "$lock" ]] || continue
+        pid=${fd_path#/proc/}
+        pid=${pid%%/*}
+        echo "$pid"
+    done | sort -u
+}
+
+# ─────────────────────────────────────────────────
+# Удерживается ли файл-блокировка кем-либо
+# Возвращает 0 — удерживается, 1 — свободен
+# ─────────────────────────────────────────────────
+is_lock_held() {
+    local holders
+    holders=$(lock_holders "$1")
+    [[ -n "$holders" ]]
 }
 
 # ─────────────────────────────────────────────────
@@ -274,6 +412,9 @@ wait_for_apt_lock() {
     local max_wait=60    # после остановки служб ждём не более 60с
     local waited=0
     local sleep_interval=3
+
+    # Выбираем метод проверки локов при первом вызове
+    [[ -n "$LOCK_CHECK_METHOD" ]] || detect_lock_check_method
 
     # Службы, которые чаще всего держат APT-блокировку на Ubuntu
     local blocking_services=(
@@ -330,25 +471,18 @@ wait_for_apt_lock() {
     local locks=("/var/lib/dpkg/lock-frontend" "/var/lib/apt/lists/lock")
 
     for lock in "${locks[@]}"; do
-        while true; do
-            set +e
-            fuser "$lock" > /dev/null 2>&1
-            local locked=$?
-            set -e
-
-            if (( locked != 0 )); then
-                break  # лок свободен
-            fi
-
+        while is_lock_held "$lock"; do
             if (( waited >= max_wait )); then
-                log_error "Таймаут ${max_wait}с: APT-блокировка не освободилась"
-                log_error "Процесс, держащий лок: $(lsof $lock 2>/dev/null | tail -1)"
+                local holders
+                holders=$(lock_holders "$lock" | tr '\n' ' ')
+                log_error "Таймаут ${max_wait}с: блокировка $lock не освободилась"
+                log_error "Удерживающие процессы (PID): ${holders:-не определены}"
                 log_error "Попробуйте вручную: systemctl stop unattended-upgrades && sudo ./setup_remnawave_node.sh"
                 exit 1
             fi
 
             sleep "$sleep_interval"
-            (( waited += sleep_interval ))
+            waited=$(( waited + sleep_interval ))
         done
     done
 
@@ -501,24 +635,41 @@ create_monitoring_dirs() {
 }
 
 # ─────────────────────────────────────────────────
-# Вспомогательная функция: проверка версии бинарника
-# Возвращает версию или "none" если файла нет
+# Определение версии установленного бинарника
+#
+# Компоненты используют разные библиотеки разбора флагов:
+# node_exporter собран на kingpin и понимает только --version,
+# cAdvisor и vmagent используют стандартный Go flag, который
+# принимает обе формы. Поэтому пробуем оба варианта по очереди
+# и берём первый вывод, из которого удалось извлечь версию.
+#
+# Возвращает:
+#   "none"    — файла нет или он не исполняемый
+#   "unknown" — бинарник есть, но версию извлечь не удалось
+#   x.y.z     — найденная версия
 # ─────────────────────────────────────────────────
 get_binary_version() {
     local binary="$1"
-    local version_flag="${2:---version}"
 
-    if [[ ! -f "$binary" ]]; then
+    if [[ ! -x "$binary" ]]; then
         echo "none"
         return
     fi
 
-    set +e
-    local ver
-    ver=$("$binary" "$version_flag" 2>&1 | grep -oP '\d+\.\d+\.\d+' | head -n1)
-    set -e
+    local flag out ver
+    for flag in --version -version; do
+        set +e
+        out=$("$binary" "$flag" 2>&1)
+        set -e
 
-    echo "${ver:-unknown}"
+        ver=$(grep -oP '\d+\.\d+\.\d+' <<< "$out" | head -n1 || true)
+        if [[ -n "$ver" ]]; then
+            echo "$ver"
+            return
+        fi
+    done
+
+    echo "unknown"
 }
 
 # ─────────────────────────────────────────────────
@@ -534,14 +685,16 @@ install_cadvisor() {
     {
         # Проверяем текущую версию (если бинарник уже есть)
         local current_ver
-        current_ver=$(get_binary_version "$target" "--version")
+        current_ver=$(get_binary_version "$target")
 
         if [[ "$current_ver" == "$CADVISOR_VERSION" ]]; then
-            echo "SKIP: cAdvisor v${CADVISOR_VERSION} уже установлен" >> "$log_file"
-            echo "0" > "$status_file"
+            echo "SKIP" > "$status_file"
+            echo "cAdvisor v${CADVISOR_VERSION} уже установлен" >> "$log_file"
             return
+        elif [[ "$current_ver" == "unknown" ]]; then
+            echo "Версия существующего бинарника cAdvisor не определена — скачиваем заново" >> "$log_file"
         elif [[ "$current_ver" != "none" ]]; then
-            echo "UPDATE: cAdvisor $current_ver → $CADVISOR_VERSION" >> "$log_file"
+            echo "Обновление cAdvisor $current_ver → $CADVISOR_VERSION" >> "$log_file"
         fi
 
         local url="https://github.com/google/cadvisor/releases/download/v${CADVISOR_VERSION}/cadvisor-v${CADVISOR_VERSION}-linux-${ARCH_SUFFIX}"
@@ -551,11 +704,12 @@ install_cadvisor() {
             "$url" >> "$log_file" 2>&1; then
             mv "${target}.tmp" "$target"
             chmod +x "$target"
-            echo "OK: cAdvisor v${CADVISOR_VERSION} установлен" >> "$log_file"
-            echo "0" > "$status_file"
+            echo "OK" > "$status_file"
+            echo "cAdvisor v${CADVISOR_VERSION} установлен" >> "$log_file"
         else
-            echo "FAIL: ошибка при скачивании cAdvisor" >> "$log_file"
-            echo "1" > "$status_file"
+            rm -f "${target}.tmp"
+            echo "FAIL" > "$status_file"
+            echo "ошибка при скачивании cAdvisor ($url)" >> "$log_file"
         fi
     }
 }
@@ -570,31 +724,37 @@ install_node_exporter() {
 
     {
         local current_ver
-        current_ver=$(get_binary_version "$target" "--version")
+        current_ver=$(get_binary_version "$target")
 
         if [[ "$current_ver" == "$NODE_EXPORTER_VERSION" ]]; then
-            echo "SKIP: Node Exporter v${NODE_EXPORTER_VERSION} уже установлен" >> "$log_file"
-            echo "0" > "$status_file"
+            echo "SKIP" > "$status_file"
+            echo "Node Exporter v${NODE_EXPORTER_VERSION} уже установлен" >> "$log_file"
             return
+        elif [[ "$current_ver" == "unknown" ]]; then
+            echo "Версия существующего бинарника Node Exporter не определена — скачиваем заново" >> "$log_file"
+        elif [[ "$current_ver" != "none" ]]; then
+            echo "Обновление Node Exporter $current_ver → $NODE_EXPORTER_VERSION" >> "$log_file"
         fi
 
         local archive="node_exporter-${NODE_EXPORTER_VERSION}.linux-${ARCH_SUFFIX}.tar.gz"
         local url="https://github.com/prometheus/node_exporter/releases/download/v${NODE_EXPORTER_VERSION}/${archive}"
         local tmp_archive="${TMP_DIR}/${archive}"
+        local unpacked="${TMP_DIR}/node_exporter-${NODE_EXPORTER_VERSION}.linux-${ARCH_SUFFIX}"
 
         if wget -q --timeout=120 --tries=3 \
             -O "$tmp_archive" \
-            "$url" >> "$log_file" 2>&1; then
-            tar -xzf "$tmp_archive" -C "$TMP_DIR" >> "$log_file" 2>&1
-            mv "${TMP_DIR}/node_exporter-${NODE_EXPORTER_VERSION}.linux-${ARCH_SUFFIX}/node_exporter" "$target"
+            "$url" >> "$log_file" 2>&1 \
+            && tar -xzf "$tmp_archive" -C "$TMP_DIR" >> "$log_file" 2>&1 \
+            && mv "${unpacked}/node_exporter" "$target"; then
             chmod +x "$target"
             # Очищаем распакованную директорию
-            rm -rf "${TMP_DIR}/node_exporter-${NODE_EXPORTER_VERSION}.linux-${ARCH_SUFFIX}" "$tmp_archive"
-            echo "OK: Node Exporter v${NODE_EXPORTER_VERSION} установлен" >> "$log_file"
-            echo "0" > "$status_file"
+            rm -rf "$unpacked" "$tmp_archive"
+            echo "OK" > "$status_file"
+            echo "Node Exporter v${NODE_EXPORTER_VERSION} установлен" >> "$log_file"
         else
-            echo "FAIL: ошибка при скачивании Node Exporter" >> "$log_file"
-            echo "1" > "$status_file"
+            rm -rf "$unpacked" "$tmp_archive"
+            echo "FAIL" > "$status_file"
+            echo "ошибка при загрузке или распаковке Node Exporter ($url)" >> "$log_file"
         fi
     }
 }
@@ -609,12 +769,16 @@ install_vmagent() {
 
     {
         local current_ver
-        current_ver=$(get_binary_version "$target" "--version")
+        current_ver=$(get_binary_version "$target")
 
         if [[ "$current_ver" == "$VMAGENT_VERSION" ]]; then
-            echo "SKIP: vmagent v${VMAGENT_VERSION} уже установлен" >> "$log_file"
-            echo "0" > "$status_file"
+            echo "SKIP" > "$status_file"
+            echo "vmagent v${VMAGENT_VERSION} уже установлен" >> "$log_file"
             return
+        elif [[ "$current_ver" == "unknown" ]]; then
+            echo "Версия существующего бинарника vmagent не определена — скачиваем заново" >> "$log_file"
+        elif [[ "$current_ver" != "none" ]]; then
+            echo "Обновление vmagent $current_ver → $VMAGENT_VERSION" >> "$log_file"
         fi
 
         # Для arm64 VictoriaMetrics использует суффикс "arm64" в архиве
@@ -625,18 +789,20 @@ install_vmagent() {
 
         if wget -q --timeout=120 --tries=3 \
             -O "$tmp_archive" \
-            "$url" >> "$log_file" 2>&1; then
-            tar -xzf "$tmp_archive" -C "$TMP_DIR" >> "$log_file" 2>&1
-            mv "${TMP_DIR}/vmagent-prod" "$target"
+            "$url" >> "$log_file" 2>&1 \
+            && tar -xzf "$tmp_archive" -C "$TMP_DIR" >> "$log_file" 2>&1 \
+            && mv "${TMP_DIR}/vmagent-prod" "$target"; then
             chmod +x "$target"
             rm -f "$tmp_archive"
             # Удаляем прочие бинарники из vmutils (vmbackup, vmctl и т.д.)
             find "$TMP_DIR" -maxdepth 1 -name "*-prod" -delete 2>/dev/null || true
-            echo "OK: vmagent v${VMAGENT_VERSION} установлен" >> "$log_file"
-            echo "0" > "$status_file"
+            echo "OK" > "$status_file"
+            echo "vmagent v${VMAGENT_VERSION} установлен" >> "$log_file"
         else
-            echo "FAIL: ошибка при скачивании vmagent" >> "$log_file"
-            echo "1" > "$status_file"
+            rm -f "$tmp_archive"
+            find "$TMP_DIR" -maxdepth 1 -name "*-prod" -delete 2>/dev/null || true
+            echo "FAIL" > "$status_file"
+            echo "ошибка при загрузке или распаковке vmagent ($url)" >> "$log_file"
         fi
     }
 }
@@ -675,7 +841,9 @@ install_all_monitoring_binaries() {
     wait "$pid_vmagent" || true
 
     # Читаем статусы из файлов (фоновые процессы могут завершиться с 0
-    # даже при ошибке внутри функции, поэтому используем файл статуса)
+    # даже при ошибке внутри функции, поэтому используем файл статуса).
+    # Протокол: файл статуса содержит ровно одно слово — OK, SKIP или FAIL;
+    # значение "pending" означает, что подпроцесс не дошёл до записи статуса.
     local components=("cadvisor" "nodeexporter" "vmagent")
     for comp in "${components[@]}"; do
         local status_file="$TMP_DIR/${comp}.status"
@@ -686,23 +854,33 @@ install_all_monitoring_binaries() {
             cat "$log_file" >> "$LOG_FILE"
         fi
 
-        if [[ ! -f "$status_file" ]]; then
-            log_error "Файл статуса для $comp не найден (загрузка не завершилась)"
-            has_error=1
-        else
-            local status
-            status=$(cat "$status_file")
-            if [[ "$status" == "0" ]]; then
-                local msg
-                msg=$(cat "$log_file" 2>/dev/null | head -n1 || echo "OK")
-                log_info "✓ $comp: $msg"
-            elif [[ "$status" == "SKIP"* ]]; then
-                log_warning "$comp: уже актуальной версии, пропущен"
-            else
-                log_error "Ошибка при установке $comp. Подробности: $log_file"
+        local status="MISSING"
+        [[ -f "$status_file" ]] && status=$(cat "$status_file")
+
+        # Итог компонента — последняя строка его лога
+        local msg=""
+        [[ -f "$log_file" ]] && msg=$(tail -n1 "$log_file" 2>/dev/null || true)
+
+        case "$status" in
+            OK)
+                log_info "✓ $comp: ${msg:-установлен}"
+                ;;
+            SKIP)
+                log_warning "$comp: ${msg:-уже актуальной версии, пропущен}"
+                ;;
+            FAIL)
+                log_error "$comp: ${msg:-ошибка установки}"
                 has_error=1
-            fi
-        fi
+                ;;
+            pending|MISSING)
+                log_error "$comp: загрузка не завершилась (статус: $status)"
+                has_error=1
+                ;;
+            *)
+                log_error "$comp: неизвестный статус '$status'"
+                has_error=1
+                ;;
+        esac
     done
 
     if (( has_error == 1 )); then
@@ -862,29 +1040,103 @@ start_monitoring_services() {
 }
 
 # ─────────────────────────────────────────────────
+# Подтверждение SSH-портов перед включением UFW
+#
+# Это единственный шаг, ошибка в котором стоит потери доступа
+# к серверу, поэтому список портов показывается пользователю
+# и требует явного подтверждения.
+# ─────────────────────────────────────────────────
+confirm_ssh_ports() {
+    mapfile -t SSH_PORTS < <(detect_ssh_ports)
+
+    echo ""
+    echo -e "${CYAN}──────────────── SSH и firewall ────────────────${NC}"
+    echo -e "Обнаружены SSH-порты: ${GREEN}${SSH_PORTS[*]}${NC}"
+    echo -e "Они будут разрешены в UFW ${YELLOW}до${NC} его включения."
+    echo -e "${RED}Если список неполный — вы потеряете доступ к серверу по SSH.${NC}"
+    echo ""
+
+    local answer
+    while true; do
+        read -rp "$(echo -e "Продолжить с этими портами? [${GREEN}Y${NC}=да / ${RED}n${NC}=отмена / ${YELLOW}e${NC}=изменить]: ")" answer < /dev/tty
+        answer="${answer:-y}"
+
+        case "${answer,,}" in
+            y|yes|д|да)
+                return 0
+                ;;
+            e|edit|и|изменить)
+                local custom_input
+                local -a custom_ports=()
+                read -rp "$(echo -e "${YELLOW}SSH-порты через пробел${NC}: ")" custom_input < /dev/tty
+
+                local p
+                local valid=1
+                # $custom_input намеренно без кавычек: нужен разбор
+                # строки на отдельные порты по пробелам
+                # shellcheck disable=SC2086
+                for p in $custom_input; do
+                    if validate_port "$p"; then
+                        custom_ports+=("$p")
+                    else
+                        echo -e "${RED}Некорректный порт: $p${NC}"
+                        valid=0
+                        break
+                    fi
+                done
+
+                if (( valid == 1 )) && (( ${#custom_ports[@]} > 0 )); then
+                    SSH_PORTS=("${custom_ports[@]}")
+                    echo -e "Порты обновлены: ${GREEN}${SSH_PORTS[*]}${NC}"
+                else
+                    echo -e "${RED}Список не изменён, введите ещё раз${NC}"
+                fi
+                ;;
+            n|no|н|нет)
+                log_error "Установка прервана пользователем до включения UFW"
+                log_info "Firewall не изменён, доступ к серверу сохранён"
+                exit 1
+                ;;
+            *)
+                echo -e "${RED}Введите y, n или e${NC}"
+                ;;
+        esac
+    done
+}
+
+# ─────────────────────────────────────────────────
 # Настройка UFW Firewall
 #
 # Открываем XRAY_PORT для TCP и UDP — Reality может
 # работать через обоих. NODE_PORT открываем только для
-# IP панели, чтобы ограничить доступ.
+# NetBird-адреса панели: панель обращается к ноде через
+# mesh-сеть, поэтому источником пакетов будет её адрес
+# в NetBird, а не публичный IP.
 # ─────────────────────────────────────────────────
 configure_firewall() {
     log "Настройка UFW Firewall..."
 
     if ! command -v ufw &> /dev/null; then
         log_info "UFW не установлен, устанавливаем..."
+        wait_for_apt_lock
         apt install -y ufw >> "$LOG_FILE" 2>&1
         log_info "✓ UFW установлен"
     fi
 
-    # SSH — разрешаем в первую очередь, чтобы не потерять доступ
-    ufw allow OpenSSH >> "$LOG_FILE" 2>&1
-    log_info "✓ OpenSSH: разрешён"
+    # SSH — разрешаем в первую очередь, чтобы не потерять доступ.
+    # Профиль OpenSSH не используем: он жёстко привязан к порту 22.
+    confirm_ssh_ports
 
-    # NODE_PORT — только для IP панели
-    ufw allow from "$PANEL_IP" to any port "$NODE_PORT" proto tcp \
-        comment "Remnawave panel → node" >> "$LOG_FILE" 2>&1
-    log_info "✓ NODE_PORT $NODE_PORT: разрешён только для $PANEL_IP"
+    local ssh_port
+    for ssh_port in "${SSH_PORTS[@]}"; do
+        ufw allow "$ssh_port"/tcp comment "SSH" >> "$LOG_FILE" 2>&1
+        log_info "✓ SSH $ssh_port/tcp: разрешён"
+    done
+
+    # NODE_PORT — только с NetBird-адреса панели
+    ufw allow from "$PANEL_NETBIRD_IP" to any port "$NODE_PORT" proto tcp \
+        comment "Remnawave panel (NetBird) -> node" >> "$LOG_FILE" 2>&1
+    log_info "✓ NODE_PORT $NODE_PORT: разрешён только для $PANEL_NETBIRD_IP (NetBird)"
 
     # XRAY_PORT — для всех входящих (клиентские подключения)
     # Открываем и TCP, и UDP: Reality+TCP и возможные QUIC-транспорты
@@ -1018,8 +1270,8 @@ show_next_steps() {
     echo ""
 
     echo -e "${BLUE}🔒 Firewall (UFW):${NC}"
-    echo -e "   ✓ OpenSSH              — разрешён"
-    echo -e "   ✓ NODE_PORT $NODE_PORT  — только для $PANEL_IP (TCP)"
+    echo -e "   ✓ SSH ${SSH_PORTS[*]}          — разрешён (TCP)"
+    echo -e "   ✓ NODE_PORT $NODE_PORT  — только для $PANEL_NETBIRD_IP (NetBird, TCP)"
     echo -e "   ✓ XRAY_PORT $XRAY_PORT — все (TCP + UDP)"
     echo ""
 
@@ -1053,13 +1305,15 @@ show_next_steps() {
 # ─────────────────────────────────────────────────
 main() {
     echo -e "${GREEN}═══════════════════════════════════════════════════════════${NC}"
-    echo -e "${GREEN}   Remnawave Node Auto-Installer v3.0                      ${NC}"
+    echo -e "${GREEN}   Remnawave Node Auto-Installer v3.1                      ${NC}"
     echo -e "${GREEN}═══════════════════════════════════════════════════════════${NC}"
     echo ""
 
+    # Проверка root идёт первой: touch /var/log/... без прав выдал бы
+    # "Permission denied" вместо понятного сообщения
+    check_root
     touch "$LOG_FILE"
 
-    check_root
     detect_arch
     ask_params
 
