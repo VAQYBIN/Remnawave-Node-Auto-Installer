@@ -2,7 +2,13 @@
 
 #####################################################
 # Скрипт автоматической настройки Remnawave Node
-# Версия: 3.2
+# Версия: 3.2.1
+#
+# Исправления в v3.2.1:
+#   - Установка больше не требует wget: загрузчик выбирается по
+#     факту наличия (curl или wget), недостающий доустанавливается
+#   - Зависимости проверяются заранее, а не в момент загрузки
+#   - Вывод загрузчика не подавляется — причина сбоя попадает в лог
 #
 # Новое в v3.2:
 #   - Неинтерактивный режим: параметры читаются из .env-файла
@@ -102,6 +108,7 @@ DEFAULT_XRAY_PORT="443"
 NETBIRD_IP=""
 ARCH_SUFFIX=""        # Определяется автоматически
 SSH_PORT_LIST=()      # Итоговый список портов для правил UFW
+DOWNLOADER=""         # "curl" или "wget" — выбирается по факту наличия
 
 # ─────────────────────────────────────────────────
 # Режим работы
@@ -419,6 +426,111 @@ detect_arch() {
 }
 
 # ─────────────────────────────────────────────────
+# Проверка внешних зависимостей
+#
+# На минимальных образах Ubuntu/Debian wget отсутствует, тогда как
+# curl обычно есть. Скрипт использует оба: curl — для установщиков
+# NetBird и Docker, wget — для бинарников мониторинга. Раньше
+# отсутствие wget обнаруживалось только в момент загрузки: три
+# параллельных процесса падали с "command not found", а сообщение
+# об ошибке говорило про недоступность GitHub.
+#
+# Теперь загрузчик выбирается по факту наличия, а недостающие
+# пакеты доустанавливаются заранее — до долгих шагов установки.
+# ─────────────────────────────────────────────────
+ensure_dependencies() {
+    log "Проверка зависимостей..."
+
+    # Загрузчик: curl предпочтительнее — он нужен и для установщиков
+    # NetBird и Docker, которые читают скрипт из pipe
+    if command -v curl &> /dev/null; then
+        DOWNLOADER="curl"
+    elif command -v wget &> /dev/null; then
+        DOWNLOADER="wget"
+    fi
+
+    # Собираем всё недостающее и ставим одной командой
+    local missing_pkgs=()
+    [[ -z "$DOWNLOADER" ]] && missing_pkgs+=("curl")
+    command -v tar &> /dev/null || missing_pkgs+=("tar")
+
+    if (( ${#missing_pkgs[@]} > 0 )); then
+        log_warning "Отсутствуют: ${missing_pkgs[*]} — устанавливаем"
+        wait_for_apt_lock
+
+        if apt install -y "${missing_pkgs[@]}" >> "$LOG_FILE" 2>&1; then
+            log_info "✓ Установлено: ${missing_pkgs[*]}"
+        else
+            log_error "Не удалось установить: ${missing_pkgs[*]}"
+            log_error "Установите вручную: apt install -y ${missing_pkgs[*]}"
+            exit 1
+        fi
+
+        [[ -z "$DOWNLOADER" ]] && DOWNLOADER="curl"
+    fi
+
+    # Убеждаемся, что загрузчик действительно работает
+    if ! command -v "$DOWNLOADER" &> /dev/null; then
+        log_error "Загрузчик $DOWNLOADER недоступен после установки"
+        exit 1
+    fi
+
+    log_info "✓ Загрузчик: $DOWNLOADER"
+}
+
+# ─────────────────────────────────────────────────
+# Загрузка файла по URL в указанный путь
+#
+# Диагностика загрузчика намеренно НЕ подавляется: раньше
+# wget вызывался с -q, поэтому причина сбоя (DNS, 404, таймаут,
+# отсутствие самого wget) в лог не попадала, и сообщение об
+# ошибке вводило в заблуждение.
+#
+# Аргументы: URL, путь назначения. Код возврата — от загрузчика.
+# ─────────────────────────────────────────────────
+download_file() {
+    local url="$1"
+    local dest="$2"
+
+    case "$DOWNLOADER" in
+        curl)
+            # -f  — ненулевой код на HTTP-ошибках, иначе тело 404 сохранится как файл
+            # -L  — идти за редиректами: GitHub перенаправляет релизы на CDN
+            # -sS — без прогресс-бара, но с сообщениями об ошибках
+            curl -fsSL --connect-timeout 30 --max-time 600 --retry 3 \
+                 -o "$dest" "$url"
+            ;;
+        wget)
+            wget --timeout=120 --tries=3 -O "$dest" "$url"
+            ;;
+        *)
+            echo "внутренняя ошибка: загрузчик не определён" >&2
+            return 1
+            ;;
+    esac
+}
+
+# ─────────────────────────────────────────────────
+# Загрузка по URL в stdout (для установщиков вида "... | sh")
+# ─────────────────────────────────────────────────
+download_stdout() {
+    local url="$1"
+
+    case "$DOWNLOADER" in
+        curl)
+            curl -fsSL --connect-timeout 30 --max-time 600 "$url"
+            ;;
+        wget)
+            wget -qO- --timeout=120 --tries=3 "$url"
+            ;;
+        *)
+            echo "внутренняя ошибка: загрузчик не определён" >&2
+            return 1
+            ;;
+    esac
+}
+
+# ─────────────────────────────────────────────────
 # Валидация IPv4-адреса
 # Используется при вводе IP панели
 # ─────────────────────────────────────────────────
@@ -556,7 +668,7 @@ resolve_params() {
 
     echo ""
     echo -e "${BLUE}╔════════════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BLUE}║         Настройка параметров Remnawave Node v3.2                   ║${NC}"
+    echo -e "${BLUE}║         Настройка параметров Remnawave Node v3.2.1                 ║${NC}"
     echo -e "${BLUE}╚════════════════════════════════════════════════════════════════════╝${NC}"
     echo ""
 
@@ -954,7 +1066,7 @@ install_netbird() {
         ver=$(netbird version 2>/dev/null | head -n1 || echo "unknown")
         log_warning "NetBird уже установлен ($ver), пропускаем"
     else
-        if curl -fsSL https://pkgs.netbird.io/install.sh | sh >> "$LOG_FILE" 2>&1; then
+        if download_stdout https://pkgs.netbird.io/install.sh | sh >> "$LOG_FILE" 2>&1; then
             log "✓ NetBird успешно установлен"
         else
             log_error "Ошибка при установке NetBird"
@@ -1004,7 +1116,7 @@ install_docker() {
         ver=$(docker --version)
         log_warning "Docker уже установлен ($ver), пропускаем"
     else
-        if curl -fsSL https://get.docker.com | sh >> "$LOG_FILE" 2>&1; then
+        if download_stdout https://get.docker.com | sh >> "$LOG_FILE" 2>&1; then
             log "✓ Docker успешно установлен"
 
             # Добавляем SUDO_USER в группу docker (если запущено через sudo)
@@ -1106,9 +1218,7 @@ install_cadvisor() {
 
         local url="https://github.com/google/cadvisor/releases/download/v${CADVISOR_VERSION}/cadvisor-v${CADVISOR_VERSION}-linux-${ARCH_SUFFIX}"
 
-        if wget -q --timeout=120 --tries=3 \
-            -O "${target}.tmp" \
-            "$url" >> "$log_file" 2>&1; then
+        if download_file "$url" "${target}.tmp" >> "$log_file" 2>&1; then
             mv "${target}.tmp" "$target"
             chmod +x "$target"
             echo "OK" > "$status_file"
@@ -1148,9 +1258,7 @@ install_node_exporter() {
         local tmp_archive="${TMP_DIR}/${archive}"
         local unpacked="${TMP_DIR}/node_exporter-${NODE_EXPORTER_VERSION}.linux-${ARCH_SUFFIX}"
 
-        if wget -q --timeout=120 --tries=3 \
-            -O "$tmp_archive" \
-            "$url" >> "$log_file" 2>&1 \
+        if download_file "$url" "$tmp_archive" >> "$log_file" 2>&1 \
             && tar -xzf "$tmp_archive" -C "$TMP_DIR" >> "$log_file" 2>&1 \
             && mv "${unpacked}/node_exporter" "$target"; then
             chmod +x "$target"
@@ -1194,9 +1302,7 @@ install_vmagent() {
         local url="https://github.com/VictoriaMetrics/VictoriaMetrics/releases/download/v${VMAGENT_VERSION}/${archive}"
         local tmp_archive="${TMP_DIR}/${archive}"
 
-        if wget -q --timeout=120 --tries=3 \
-            -O "$tmp_archive" \
-            "$url" >> "$log_file" 2>&1 \
+        if download_file "$url" "$tmp_archive" >> "$log_file" 2>&1 \
             && tar -xzf "$tmp_archive" -C "$TMP_DIR" >> "$log_file" 2>&1 \
             && mv "${TMP_DIR}/vmagent-prod" "$target"; then
             chmod +x "$target"
@@ -1746,7 +1852,7 @@ main() {
     parse_args "$@"
 
     echo -e "${GREEN}═══════════════════════════════════════════════════════════${NC}"
-    echo -e "${GREEN}   Remnawave Node Auto-Installer v3.2                      ${NC}"
+    echo -e "${GREEN}   Remnawave Node Auto-Installer v3.2.1                    ${NC}"
     echo -e "${GREEN}═══════════════════════════════════════════════════════════${NC}"
     echo ""
 
@@ -1770,6 +1876,10 @@ main() {
 
     # Базовые компоненты
     update_system
+    # После apt update, но до первой загрузки: списки пакетов уже
+    # актуальны, а недостающий загрузчик обнаружится сразу, а не
+    # на середине установки
+    ensure_dependencies
     install_netbird
     setup_netbird
     install_docker

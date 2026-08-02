@@ -1,6 +1,6 @@
 # Скрипты автоматизации развертывания Remnawave Node
 
-[![GitHub release](https://img.shields.io/badge/version-v3.2-blue.svg)](https://github.com/VAQYBIN/Remnawave-Node-Auto-Installer/releases)
+[![GitHub release](https://img.shields.io/badge/version-v3.2.1-blue.svg)](https://github.com/VAQYBIN/Remnawave-Node-Auto-Installer/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Shell](https://img.shields.io/badge/Shell-Bash-green.svg)](https://www.gnu.org/software/bash/)
 
@@ -700,6 +700,16 @@ systemctl status cadvisor
 ---
 
 ## 📝 Changelog
+
+### v3.2.1
+- 🐛 **Установка больше не требует `wget`.** На минимальных образах Ubuntu/Debian
+  его нет, и все три загрузки бинарников мониторинга падали с `command not found`,
+  а сообщение об ошибке указывало на недоступность GitHub. Теперь загрузчик
+  выбирается по факту наличия (`curl` или `wget`), а недостающий доустанавливается
+- 🐛 Вывод загрузчика больше не подавляется — реальная причина сбоя (DNS, 404,
+  таймаут) попадает в лог
+- 🔧 Зависимости (`curl`/`wget`, `tar`) проверяются в начале установки, а не
+  обнаруживаются на середине
 
 ### v3.2
 - ➕ **Неинтерактивный режим**: параметры задаются в `.env`-файле и/или
