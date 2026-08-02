@@ -1,0 +1,5 @@
+# Файлы конфигурации с секретами: NetBird setup key, SECRET_KEY ноды.
+# Шаблон без значений лежит в .env.example и коммитится.
+.env
+*.env
+!.env.example

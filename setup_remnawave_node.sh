@@ -2,7 +2,14 @@
 
 #####################################################
 # Скрипт автоматической настройки Remnawave Node
-# Версия: 3.1
+# Версия: 3.2
+#
+# Новое в v3.2:
+#   - Неинтерактивный режим: параметры читаются из .env-файла
+#     и/или переменных окружения
+#   - Флаги --config, --non-interactive, --no-save-env, --help
+#   - Ответы интерактивного режима сохраняются в .env (chmod 600),
+#     повторная установка проходит без вопросов
 #
 # Исправления в v3.1:
 #   - UFW больше не отрезает SSH на нестандартном порту:
@@ -64,17 +71,59 @@ NODE_EXPORTER_VERSION="1.9.1"
 VMAGENT_VERSION="1.123.0"
 
 # ─────────────────────────────────────────────────
-# Параметры (заполняются интерактивно)
+# Параметры установки
+#
+# Каждый параметр инициализируется как "${VAR:-}", а не пустой
+# строкой: это сохраняет значение, переданное через окружение.
+# Простое VAR="" затёрло бы его, и режим
+#   NETBIRD_SETUP_KEY=xxx sudo bash setup_remnawave_node.sh
+# перестал бы работать.
+#
+# Источники значений, в порядке убывания приоритета:
+#   1. переменная окружения
+#   2. файл конфигурации (.env)
+#   3. значение по умолчанию
+#   4. интерактивный вопрос
 # ─────────────────────────────────────────────────
-NETBIRD_SETUP_KEY=""
-INSTANCE_NAME=""
-VICTORIA_METRICS_URL=""
-NODE_PORT=""
-XRAY_PORT=""
-PANEL_NETBIRD_IP=""   # NetBird IP панели (100.x.x.x), а не публичный
+NETBIRD_SETUP_KEY="${NETBIRD_SETUP_KEY:-}"
+INSTANCE_NAME="${INSTANCE_NAME:-}"
+VICTORIA_METRICS_URL="${VICTORIA_METRICS_URL:-}"
+NODE_PORT="${NODE_PORT:-}"
+XRAY_PORT="${XRAY_PORT:-}"
+PANEL_NETBIRD_IP="${PANEL_NETBIRD_IP:-}"   # NetBird IP панели (100.x.x.x), а не публичный
+SSH_PORTS="${SSH_PORTS:-}"                 # строка "22 2233"; пусто — автоопределение
+SECRET_KEY="${SECRET_KEY:-}"               # выдаётся панелью при создании ноды
+
+# Значения по умолчанию для необязательных параметров
+DEFAULT_NODE_PORT="2222"
+DEFAULT_XRAY_PORT="443"
+
+# Вычисляются в процессе работы
 NETBIRD_IP=""
 ARCH_SUFFIX=""        # Определяется автоматически
-SSH_PORTS=()          # Определяются автоматически перед включением UFW
+SSH_PORT_LIST=()      # Итоговый список портов для правил UFW
+
+# ─────────────────────────────────────────────────
+# Режим работы
+# ─────────────────────────────────────────────────
+ENV_FILE="${REMNAWAVE_ENV_FILE:-/opt/remnawave-installer/.env}"
+NON_INTERACTIVE=0
+SAVE_ENV=1
+
+# Белый список параметров, распознаваемых в файле конфигурации.
+# Всё остальное игнорируется с предупреждением — это ловит опечатки
+# и не даёт файлу конфигурации переопределить внутренние переменные
+# скрипта (пути, версии компонентов, режим работы).
+ENV_KEYS=(
+    NETBIRD_SETUP_KEY
+    INSTANCE_NAME
+    VICTORIA_METRICS_URL
+    NODE_PORT
+    XRAY_PORT
+    PANEL_NETBIRD_IP
+    SSH_PORTS
+    SECRET_KEY
+)
 
 # Метод проверки APT-блокировки: "fuser" или "proc".
 # Выбирается один раз при первом обращении.
@@ -106,6 +155,232 @@ cleanup() {
     rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT
+
+# ─────────────────────────────────────────────────
+# Справка по использованию
+# ─────────────────────────────────────────────────
+usage() {
+    cat <<'USAGE'
+Remnawave Node Auto-Installer
+
+Использование:
+  sudo ./setup_remnawave_node.sh [ОПЦИИ]
+  sudo bash <(curl -fsSL git.new/remnawave-setup) [ОПЦИИ]
+
+Опции:
+  -c, --config PATH     Путь к файлу конфигурации
+                        (по умолчанию: /opt/remnawave-installer/.env)
+  -n, --non-interactive Не задавать вопросов. При нехватке обязательных
+                        параметров скрипт завершится с ошибкой
+      --no-save-env     Не сохранять введённые ответы в файл конфигурации
+  -h, --help            Показать эту справку
+
+Параметры конфигурации (файл .env или переменные окружения):
+
+  Обязательные:
+    NETBIRD_SETUP_KEY     Ключ из панели app.netbird.io
+    INSTANCE_NAME         Имя ноды для метрик, например de-node-01
+    VICTORIA_METRICS_URL  IP или URL Victoria Metrics
+    PANEL_NETBIRD_IP      NetBird IP панели Remnawave (100.x.x.x)
+
+  Необязательные:
+    NODE_PORT             Порт для связи с панелью (по умолчанию 2222)
+    XRAY_PORT             Порт входящих VPN-подключений (по умолчанию 443)
+    SSH_PORTS             Порты SSH через пробел, например "22 2233".
+                          Если не задан — определяются автоматически
+    SECRET_KEY            Ключ ноды из панели. Если не задан, в
+                          docker-compose.yml пишется плейсхолдер
+
+Приоритет источников: переменная окружения → файл конфигурации →
+значение по умолчанию → интерактивный вопрос.
+
+Примеры:
+  # Обычная интерактивная установка; ответы сохранятся в .env
+  sudo ./setup_remnawave_node.sh
+
+  # Полностью автоматическая установка из файла
+  sudo ./setup_remnawave_node.sh --config /root/node.conf --non-interactive
+
+  # Общие параметры в файле, уникальные — через окружение
+  sudo INSTANCE_NAME=de-node-02 SECRET_KEY=xxx \
+       ./setup_remnawave_node.sh --non-interactive
+
+Важно: переменные указывайте ПОСЛЕ sudo. Запись вида
+"VAR=x sudo ./script" не сработает — sudo очищает окружение.
+USAGE
+}
+
+# ─────────────────────────────────────────────────
+# Разбор аргументов командной строки
+# ─────────────────────────────────────────────────
+parse_args() {
+    while (( $# > 0 )); do
+        case "$1" in
+            -c|--config)
+                if [[ -z "${2:-}" ]]; then
+                    echo "Ошибка: $1 требует указания пути" >&2
+                    exit 1
+                fi
+                ENV_FILE="$2"
+                shift 2
+                ;;
+            --config=*)
+                ENV_FILE="${1#*=}"
+                shift
+                ;;
+            -n|--non-interactive)
+                NON_INTERACTIVE=1
+                shift
+                ;;
+            --no-save-env)
+                SAVE_ENV=0
+                shift
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                echo "Неизвестный аргумент: $1" >&2
+                echo "Используйте --help для справки" >&2
+                exit 1
+                ;;
+        esac
+    done
+
+    # Без управляющего терминала задавать вопросы невозможно
+    # (cron, Ansible, CI). Переходим в неинтерактивный режим сами,
+    # иначе первый же read упал бы с невнятной ошибкой.
+    if (( NON_INTERACTIVE == 0 )) && ! [[ -r /dev/tty ]]; then
+        NON_INTERACTIVE=1
+    fi
+}
+
+# ─────────────────────────────────────────────────
+# Проверка, что ключ входит в белый список
+# ─────────────────────────────────────────────────
+is_known_env_key() {
+    local candidate="$1" key
+    for key in "${ENV_KEYS[@]}"; do
+        [[ "$key" == "$candidate" ]] && return 0
+    done
+    return 1
+}
+
+# ─────────────────────────────────────────────────
+# Загрузка параметров из файла конфигурации
+#
+# Файл разбирается построчно, а не через source: так он не может
+# выполнить произвольный код, а неизвестные ключи отсеиваются по
+# белому списку. Значения, уже заданные через окружение, не
+# перезаписываются — окружение имеет более высокий приоритет.
+# ─────────────────────────────────────────────────
+load_env_file() {
+    if [[ ! -f "$ENV_FILE" ]]; then
+        if (( NON_INTERACTIVE == 1 )); then
+            log_warning "Файл конфигурации не найден: $ENV_FILE"
+        else
+            log_info "Файл конфигурации не найден ($ENV_FILE) — параметры запросим интерактивно"
+        fi
+        return 0
+    fi
+
+    # Файл содержит ключи NetBird и SECRET_KEY — предупреждаем о правах
+    local perms
+    perms=$(stat -c '%a' "$ENV_FILE" 2>/dev/null || echo "?")
+    if [[ "$perms" != "600" && "$perms" != "400" ]]; then
+        log_warning "Права на $ENV_FILE = $perms, в файле секреты. Рекомендуется: chmod 600 $ENV_FILE"
+    fi
+
+    local line key value lineno=0 loaded=0 from_env=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        lineno=$(( lineno + 1 ))
+        line="${line%$'\r'}"   # файл мог быть создан в Windows (CRLF)
+
+        # Пустые строки и комментарии
+        [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+
+        if [[ ! "$line" =~ ^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=(.*)$ ]]; then
+            log_warning "$ENV_FILE, строка $lineno: не распознана, пропущена"
+            continue
+        fi
+
+        key="${BASH_REMATCH[2]}"
+        value="${BASH_REMATCH[3]}"
+
+        # Убираем окружающие пробелы (запись "KEY = value" тоже допустима),
+        # затем окружающие кавычки
+        value="${value#"${value%%[![:space:]]*}"}"
+        value="${value%"${value##*[![:space:]]}"}"
+        if [[ "$value" =~ ^\"(.*)\"$ ]] || [[ "$value" =~ ^\'(.*)\'$ ]]; then
+            value="${BASH_REMATCH[1]}"
+        fi
+
+        if ! is_known_env_key "$key"; then
+            log_warning "$ENV_FILE, строка $lineno: неизвестный параметр '$key', пропущен"
+            continue
+        fi
+
+        # Окружение приоритетнее файла
+        if [[ -n "${!key:-}" ]]; then
+            from_env=$(( from_env + 1 ))
+            continue
+        fi
+
+        printf -v "$key" '%s' "$value"
+        loaded=$(( loaded + 1 ))
+    done < "$ENV_FILE"
+
+    log_info "Загружено параметров из $ENV_FILE: $loaded"
+    if (( from_env > 0 )); then
+        log_info "Переопределено через окружение: $from_env"
+    fi
+}
+
+# ─────────────────────────────────────────────────
+# Сохранение параметров в файл конфигурации
+#
+# Позволяет повторить установку на этой же ноде без вопросов.
+# Файл содержит секреты, поэтому создаётся с правами 600.
+# ─────────────────────────────────────────────────
+save_env_file() {
+    (( SAVE_ENV == 1 )) || return 0
+
+    local env_dir
+    env_dir=$(dirname "$ENV_FILE")
+
+    if ! mkdir -p "$env_dir" 2>/dev/null; then
+        log_warning "Не удалось создать $env_dir — параметры не сохранены"
+        return 0
+    fi
+
+    # Права выставляем до записи, чтобы секреты не полежали
+    # даже мгновение с правами по умолчанию
+    local tmp_env="${ENV_FILE}.tmp"
+    : > "$tmp_env"
+    chmod 600 "$tmp_env"
+
+    {
+        echo "# Конфигурация Remnawave Node Auto-Installer"
+        echo "# Создано автоматически: $(date +'%Y-%m-%d %H:%M:%S')"
+        echo "#"
+        echo "# Файл содержит секреты — держите права 600."
+        echo "# Повторная установка с этими параметрами:"
+        echo "#   sudo ./setup_remnawave_node.sh --config $ENV_FILE --non-interactive"
+        echo ""
+        local key
+        for key in "${ENV_KEYS[@]}"; do
+            printf '%s="%s"\n' "$key" "${!key:-}"
+        done
+    } >> "$tmp_env"
+
+    mv "$tmp_env" "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
+
+    log "✓ Параметры сохранены: $ENV_FILE (chmod 600)"
+    log_info "Повторный запуск без вопросов: --config $ENV_FILE --non-interactive"
+}
 
 # ─────────────────────────────────────────────────
 # Проверка прав root
@@ -221,114 +496,246 @@ detect_ssh_ports() {
 }
 
 # ─────────────────────────────────────────────────
-# Интерактивный сбор параметров
+# Приведение адреса Victoria Metrics к полному URL
+#
+# Принимаем и голый IP, и URL со схемой, с портом или без.
+# Используется и для интерактивного ввода, и для значения из .env,
+# чтобы формат конечного URL не зависел от источника.
 # ─────────────────────────────────────────────────
-ask_params() {
+normalize_vm_url() {
+    local input="$1"
+
+    if [[ "$input" =~ ^https?:// ]]; then
+        # Схема есть — добавляем порт, если его не указали
+        if [[ "$input" =~ :[0-9]+(/|$) ]]; then
+            echo "$input"
+        else
+            echo "${input}:8428"
+        fi
+    else
+        # Голый IP или hostname — достраиваем схему и порт
+        echo "http://${input}:8428"
+    fi
+}
+
+# ─────────────────────────────────────────────────
+# Проверка NetBird-адреса панели
+# Возвращает 0 если адрес корректен, 1 если нет.
+# Адрес вне пула 100.64.0.0/10 не считается ошибкой (пул
+# переопределяем), но о нём предупреждаем.
+# ─────────────────────────────────────────────────
+check_panel_ip() {
+    local ip="$1"
+
+    validate_ip "$ip" || return 1
+
+    # 100.64.0.0/10 — второй октет в диапазоне 64–127
+    if [[ ! "$ip" =~ ^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\. ]]; then
+        log_warning "Адрес $ip вне стандартного пула NetBird (100.64.0.0/10)"
+        log_warning "Убедитесь, что это адрес панели в mesh-сети, а не публичный IP"
+    fi
+    return 0
+}
+
+# ─────────────────────────────────────────────────
+# Определение итоговых значений параметров
+#
+# Для каждого параметра:
+#   1. если значение уже есть (окружение или .env) — проверяем его;
+#      некорректное в интерактивном режиме сбрасывается и
+#      запрашивается заново, в неинтерактивном — это ошибка;
+#   2. если значения нет — задаём вопрос либо, в неинтерактивном
+#      режиме, добавляем параметр в список недостающих.
+#
+# Все недостающие параметры собираются и выводятся одним списком:
+# при раскатке важно узнать обо всех пропусках сразу, а не
+# по одному за запуск.
+# ─────────────────────────────────────────────────
+resolve_params() {
+    local missing=()
+
     echo ""
     echo -e "${BLUE}╔════════════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BLUE}║         Настройка параметров Remnawave Node v3.1                   ║${NC}"
+    echo -e "${BLUE}║         Настройка параметров Remnawave Node v3.2                   ║${NC}"
     echo -e "${BLUE}╚════════════════════════════════════════════════════════════════════╝${NC}"
     echo ""
 
-    # NetBird Setup Key
-    while [[ -z "$NETBIRD_SETUP_KEY" ]]; do
-        read -rp "$(echo -e "${YELLOW}NetBird Setup Key${NC} (из панели app.netbird.io): ")" NETBIRD_SETUP_KEY < /dev/tty
-        [[ -z "$NETBIRD_SETUP_KEY" ]] && echo -e "${RED}Поле обязательно для заполнения${NC}"
-    done
+    if (( NON_INTERACTIVE == 1 )); then
+        log_info "Неинтерактивный режим: вопросы задаваться не будут"
+    fi
 
-    # Название инстанса
-    while [[ -z "$INSTANCE_NAME" ]]; do
-        read -rp "$(echo -e "${YELLOW}Название инстанса${NC} (например: de-node-01, fi-node-01): ")" INSTANCE_NAME < /dev/tty
-        [[ -z "$INSTANCE_NAME" ]] && echo -e "${RED}Поле обязательно для заполнения${NC}"
-    done
-
-    # URL Victoria Metrics — принимаем IP или полный URL
-    while [[ -z "$VICTORIA_METRICS_URL" ]]; do
-        read -rp "$(echo -e "${YELLOW}IP/URL Victoria Metrics${NC} (например: 10.0.0.1 или http://10.0.0.1:8428): ")" vm_input < /dev/tty
-
-        if [[ -z "$vm_input" ]]; then
-            echo -e "${RED}Поле обязательно для заполнения${NC}"
-            continue
+    # ─── NetBird Setup Key ───
+    if [[ -z "$NETBIRD_SETUP_KEY" ]]; then
+        if (( NON_INTERACTIVE == 1 )); then
+            missing+=("NETBIRD_SETUP_KEY — ключ из панели app.netbird.io")
+        else
+            while [[ -z "$NETBIRD_SETUP_KEY" ]]; do
+                read -rp "$(echo -e "${YELLOW}NetBird Setup Key${NC} (из панели app.netbird.io): ")" NETBIRD_SETUP_KEY < /dev/tty
+                [[ -z "$NETBIRD_SETUP_KEY" ]] && echo -e "${RED}Поле обязательно для заполнения${NC}"
+            done
         fi
+    fi
 
-        # Нормализуем URL: добавляем схему и порт если не указаны
-        if [[ "$vm_input" =~ ^https?:// ]]; then
-            # Схема уже есть — проверяем наличие порта
-            if [[ "$vm_input" =~ :[0-9]+(/|$) ]]; then
-                VICTORIA_METRICS_URL="$vm_input"
-            else
-                VICTORIA_METRICS_URL="${vm_input}:8428"
+    # ─── Название инстанса ───
+    if [[ -z "$INSTANCE_NAME" ]]; then
+        if (( NON_INTERACTIVE == 1 )); then
+            missing+=("INSTANCE_NAME — имя ноды для метрик, например de-node-01")
+        else
+            while [[ -z "$INSTANCE_NAME" ]]; do
+                read -rp "$(echo -e "${YELLOW}Название инстанса${NC} (например: de-node-01, fi-node-01): ")" INSTANCE_NAME < /dev/tty
+                [[ -z "$INSTANCE_NAME" ]] && echo -e "${RED}Поле обязательно для заполнения${NC}"
+            done
+        fi
+    fi
+
+    # ─── URL Victoria Metrics ───
+    if [[ -n "$VICTORIA_METRICS_URL" ]]; then
+        VICTORIA_METRICS_URL=$(normalize_vm_url "$VICTORIA_METRICS_URL")
+    elif (( NON_INTERACTIVE == 1 )); then
+        missing+=("VICTORIA_METRICS_URL — IP или URL Victoria Metrics")
+    else
+        local vm_input=""
+        while [[ -z "$VICTORIA_METRICS_URL" ]]; do
+            read -rp "$(echo -e "${YELLOW}IP/URL Victoria Metrics${NC} (например: 10.0.0.1 или http://10.0.0.1:8428): ")" vm_input < /dev/tty
+            if [[ -z "$vm_input" ]]; then
+                echo -e "${RED}Поле обязательно для заполнения${NC}"
+                continue
             fi
-        else
-            # Только IP/hostname — добавляем схему и порт
-            VICTORIA_METRICS_URL="http://${vm_input}:8428"
+            VICTORIA_METRICS_URL=$(normalize_vm_url "$vm_input")
+        done
+    fi
+    [[ -n "$VICTORIA_METRICS_URL" ]] && log_info "URL Victoria Metrics: $VICTORIA_METRICS_URL"
+
+    # ─── NODE_PORT (необязательный, есть значение по умолчанию) ───
+    if [[ -n "$NODE_PORT" ]] && ! validate_port "$NODE_PORT"; then
+        if (( NON_INTERACTIVE == 1 )); then
+            log_error "Некорректное значение NODE_PORT='$NODE_PORT' (ожидается 1–65535)"
+            exit 1
         fi
-
-        log_info "Сформирован URL Victoria Metrics: $VICTORIA_METRICS_URL"
-    done
-
-    # NODE_PORT
-    while true; do
-        read -rp "$(echo -e "${YELLOW}NODE_PORT${NC} для связи с панелью [по умолчанию: 2222]: ")" node_port_input < /dev/tty
-        node_port_input="${node_port_input:-2222}"
-
-        if validate_port "$node_port_input"; then
-            NODE_PORT="$node_port_input"
-            break
+        log_warning "Некорректное значение NODE_PORT='$NODE_PORT' — запросим заново"
+        NODE_PORT=""
+    fi
+    if [[ -z "$NODE_PORT" ]]; then
+        if (( NON_INTERACTIVE == 1 )); then
+            NODE_PORT="$DEFAULT_NODE_PORT"
         else
-            echo -e "${RED}Некорректный порт. Введите число от 1 до 65535${NC}"
+            while true; do
+                local node_port_input=""
+                read -rp "$(echo -e "${YELLOW}NODE_PORT${NC} для связи с панелью [по умолчанию: ${DEFAULT_NODE_PORT}]: ")" node_port_input < /dev/tty
+                node_port_input="${node_port_input:-$DEFAULT_NODE_PORT}"
+                if validate_port "$node_port_input"; then
+                    NODE_PORT="$node_port_input"
+                    break
+                fi
+                echo -e "${RED}Некорректный порт. Введите число от 1 до 65535${NC}"
+            done
         fi
-    done
+    fi
 
-    # XRAY_PORT
-    while true; do
-        read -rp "$(echo -e "${YELLOW}XRAY_PORT${NC} для входящих VPN подключений [по умолчанию: 443]: ")" xray_port_input < /dev/tty
-        xray_port_input="${xray_port_input:-443}"
-
-        if validate_port "$xray_port_input"; then
-            XRAY_PORT="$xray_port_input"
-            break
+    # ─── XRAY_PORT (необязательный, есть значение по умолчанию) ───
+    if [[ -n "$XRAY_PORT" ]] && ! validate_port "$XRAY_PORT"; then
+        if (( NON_INTERACTIVE == 1 )); then
+            log_error "Некорректное значение XRAY_PORT='$XRAY_PORT' (ожидается 1–65535)"
+            exit 1
+        fi
+        log_warning "Некорректное значение XRAY_PORT='$XRAY_PORT' — запросим заново"
+        XRAY_PORT=""
+    fi
+    if [[ -z "$XRAY_PORT" ]]; then
+        if (( NON_INTERACTIVE == 1 )); then
+            XRAY_PORT="$DEFAULT_XRAY_PORT"
         else
-            echo -e "${RED}Некорректный порт. Введите число от 1 до 65535${NC}"
+            while true; do
+                local xray_port_input=""
+                read -rp "$(echo -e "${YELLOW}XRAY_PORT${NC} для входящих VPN подключений [по умолчанию: ${DEFAULT_XRAY_PORT}]: ")" xray_port_input < /dev/tty
+                xray_port_input="${xray_port_input:-$DEFAULT_XRAY_PORT}"
+                if validate_port "$xray_port_input"; then
+                    XRAY_PORT="$xray_port_input"
+                    break
+                fi
+                echo -e "${RED}Некорректный порт. Введите число от 1 до 65535${NC}"
+            done
         fi
-    done
+    fi
 
-    # NetBird IP панели Remnawave
+    # ─── NetBird IP панели Remnawave ───
     #
     # Панель обращается к ноде через mesh-сеть, поэтому в правило UFW
-    # нужен именно NetBird-адрес панели (по умолчанию из 100.64.0.0/10),
-    # а не её публичный IP: с публичного адреса пакеты к ноде не придут.
-    # Посмотреть его можно в панели NetBird в списке пиров.
-    echo ""
-    echo -e "${CYAN}NetBird IP панели${NC} — адрес панели ${YELLOW}внутри mesh-сети${NC} (обычно 100.x.x.x),"
-    echo -e "а не её публичный IP. Найти: панель NetBird → Peers → строка сервера панели."
-    while true; do
-        read -rp "$(echo -e "${YELLOW}NetBird IP панели Remnawave${NC} (для правила UFW): ")" PANEL_NETBIRD_IP < /dev/tty
-
-        if [[ -z "$PANEL_NETBIRD_IP" ]]; then
-            echo -e "${RED}Поле обязательно для заполнения${NC}"
-        elif ! validate_ip "$PANEL_NETBIRD_IP"; then
-            echo -e "${RED}Некорректный IPv4-адрес. Пример: 100.64.10.5${NC}"
-        else
-            # Мягкое предупреждение: пул NetBird можно переопределить,
-            # поэтому адрес вне 100.64.0.0/10 не считаем ошибкой.
-            # 100.64.0.0/10 — второй октет в диапазоне 64–127
-            if [[ ! "$PANEL_NETBIRD_IP" =~ ^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\. ]]; then
-                echo -e "${YELLOW}⚠ Адрес вне стандартного пула NetBird (100.64.0.0/10).${NC}"
-                echo -e "${YELLOW}  Убедитесь, что это адрес панели в mesh-сети, а не публичный IP.${NC}"
-            fi
-            break
+    # нужен именно NetBird-адрес панели, а не её публичный IP:
+    # с публичного адреса пакеты к ноде не придут.
+    if [[ -n "$PANEL_NETBIRD_IP" ]] && ! check_panel_ip "$PANEL_NETBIRD_IP"; then
+        if (( NON_INTERACTIVE == 1 )); then
+            log_error "Некорректный PANEL_NETBIRD_IP='$PANEL_NETBIRD_IP' (ожидается IPv4, например 100.64.10.5)"
+            exit 1
         fi
-    done
+        log_warning "Некорректный PANEL_NETBIRD_IP='$PANEL_NETBIRD_IP' — запросим заново"
+        PANEL_NETBIRD_IP=""
+    fi
+    if [[ -z "$PANEL_NETBIRD_IP" ]]; then
+        if (( NON_INTERACTIVE == 1 )); then
+            missing+=("PANEL_NETBIRD_IP — NetBird IP панели, обычно 100.x.x.x")
+        else
+            echo ""
+            echo -e "${CYAN}NetBird IP панели${NC} — адрес панели ${YELLOW}внутри mesh-сети${NC} (обычно 100.x.x.x),"
+            echo -e "а не её публичный IP. Найти: панель NetBird → Peers → строка сервера панели."
+            while [[ -z "$PANEL_NETBIRD_IP" ]]; do
+                read -rp "$(echo -e "${YELLOW}NetBird IP панели Remnawave${NC} (для правила UFW): ")" PANEL_NETBIRD_IP < /dev/tty
+                if [[ -z "$PANEL_NETBIRD_IP" ]]; then
+                    echo -e "${RED}Поле обязательно для заполнения${NC}"
+                elif ! check_panel_ip "$PANEL_NETBIRD_IP"; then
+                    echo -e "${RED}Некорректный IPv4-адрес. Пример: 100.64.10.5${NC}"
+                    PANEL_NETBIRD_IP=""
+                fi
+            done
+        fi
+    fi
+
+    # ─── SSH_PORTS: проверяем формат, если задан явно ───
+    if [[ -n "$SSH_PORTS" ]]; then
+        local p
+        # shellcheck disable=SC2086
+        for p in $SSH_PORTS; do
+            if ! validate_port "$p"; then
+                if (( NON_INTERACTIVE == 1 )); then
+                    log_error "Некорректный порт в SSH_PORTS: '$p'"
+                    exit 1
+                fi
+                log_warning "Некорректный порт в SSH_PORTS: '$p' — список будет определён автоматически"
+                SSH_PORTS=""
+                break
+            fi
+        done
+    fi
+
+    # ─── Отчёт о недостающих параметрах ───
+    if (( ${#missing[@]} > 0 )); then
+        echo ""
+        log_error "Не заданы обязательные параметры:"
+        local item
+        for item in "${missing[@]}"; do
+            log_error "   • $item"
+        done
+        echo ""
+        log_error "Укажите их в файле конфигурации ($ENV_FILE) или через переменные окружения"
+        log_error "Пример файла: см. .env.example в репозитории"
+        log_error "Справка: $0 --help"
+        exit 1
+    fi
 
     echo ""
-    echo -e "${CYAN}──────────────── Введённые параметры ────────────────${NC}"
-    log_info "NetBird Setup Key: [СКРЫТ]"
+    echo -e "${CYAN}──────────────── Параметры установки ────────────────${NC}"
+    log_info "NetBird Setup Key:      [СКРЫТ]"
     log_info "Название инстанса:      $INSTANCE_NAME"
     log_info "Victoria Metrics URL:   $VICTORIA_METRICS_URL"
     log_info "NODE_PORT:              $NODE_PORT"
     log_info "XRAY_PORT:              $XRAY_PORT"
     log_info "NetBird IP панели:      $PANEL_NETBIRD_IP"
+    log_info "SSH-порты:              ${SSH_PORTS:-определяются автоматически}"
+    if [[ -n "$SECRET_KEY" ]]; then
+        log_info "SECRET_KEY:             [ЗАДАН]"
+    else
+        log_info "SECRET_KEY:             не задан, будет плейсхолдер"
+    fi
     echo ""
 }
 
@@ -1047,11 +1454,30 @@ start_monitoring_services() {
 # и требует явного подтверждения.
 # ─────────────────────────────────────────────────
 confirm_ssh_ports() {
-    mapfile -t SSH_PORTS < <(detect_ssh_ports)
+    # Порты, заданные явно через SSH_PORTS, используются как есть:
+    # пользователь уже сделал осознанный выбор, переспрашивать незачем.
+    if [[ -n "$SSH_PORTS" ]]; then
+        # shellcheck disable=SC2206
+        SSH_PORT_LIST=($SSH_PORTS)
+        log_info "SSH-порты заданы явно: ${SSH_PORT_LIST[*]}"
+        return 0
+    fi
+
+    mapfile -t SSH_PORT_LIST < <(detect_ssh_ports)
+
+    # В неинтерактивном режиме полагаемся на автоопределение.
+    # Оно смотрит в sshd_config, в порт текущей сессии и в живые
+    # сокеты, но подтвердить его некому — поэтому пишем в лог явно.
+    if (( NON_INTERACTIVE == 1 )); then
+        log_warning "Неинтерактивный режим: SSH-порты определены автоматически: ${SSH_PORT_LIST[*]}"
+        log_warning "Если список неполон, доступ по SSH будет потерян после включения UFW"
+        log_info "Задайте SSH_PORTS в конфигурации, чтобы не полагаться на автоопределение"
+        return 0
+    fi
 
     echo ""
     echo -e "${CYAN}──────────────── SSH и firewall ────────────────${NC}"
-    echo -e "Обнаружены SSH-порты: ${GREEN}${SSH_PORTS[*]}${NC}"
+    echo -e "Обнаружены SSH-порты: ${GREEN}${SSH_PORT_LIST[*]}${NC}"
     echo -e "Они будут разрешены в UFW ${YELLOW}до${NC} его включения."
     echo -e "${RED}Если список неполный — вы потеряете доступ к серверу по SSH.${NC}"
     echo ""
@@ -1086,8 +1512,9 @@ confirm_ssh_ports() {
                 done
 
                 if (( valid == 1 )) && (( ${#custom_ports[@]} > 0 )); then
-                    SSH_PORTS=("${custom_ports[@]}")
-                    echo -e "Порты обновлены: ${GREEN}${SSH_PORTS[*]}${NC}"
+                    SSH_PORT_LIST=("${custom_ports[@]}")
+                    SSH_PORTS="${custom_ports[*]}"   # чтобы попало в .env
+                    echo -e "Порты обновлены: ${GREEN}${SSH_PORT_LIST[*]}${NC}"
                 else
                     echo -e "${RED}Список не изменён, введите ещё раз${NC}"
                 fi
@@ -1128,7 +1555,7 @@ configure_firewall() {
     confirm_ssh_ports
 
     local ssh_port
-    for ssh_port in "${SSH_PORTS[@]}"; do
+    for ssh_port in "${SSH_PORT_LIST[@]}"; do
         ufw allow "$ssh_port"/tcp comment "SSH" >> "$LOG_FILE" 2>&1
         log_info "✓ SSH $ssh_port/tcp: разрешён"
     done
@@ -1194,17 +1621,22 @@ get_netbird_ip() {
 generate_docker_compose() {
     log "Генерация docker-compose.yml для Remnawave Node..."
 
-    local secret_key=""
+    # SECRET_KEY может прийти из конфигурации или окружения.
+    # Если его нет — спрашиваем, а в неинтерактивном режиме
+    # оставляем плейсхолдер: ключ выдаётся панелью при создании
+    # ноды, поэтому на момент раскатки его часто ещё не существует.
+    if [[ -z "$SECRET_KEY" ]] && (( NON_INTERACTIVE == 0 )); then
+        echo ""
+        echo -e "${CYAN}──────────── SECRET_KEY для Remnawave Node ────────────${NC}"
+        echo -e "${YELLOW}SECRET_KEY выдаётся панелью Remnawave при создании ноды.${NC}"
+        echo -e "${YELLOW}Если ключ уже есть — вставьте его сейчас.${NC}"
+        echo -e "${YELLOW}Или нажмите Enter, чтобы заполнить вручную позже.${NC}"
+        echo ""
 
-    echo ""
-    echo -e "${CYAN}──────────── SECRET_KEY для Remnawave Node ────────────${NC}"
-    echo -e "${YELLOW}SECRET_KEY выдаётся панелью Remnawave при создании ноды.${NC}"
-    echo -e "${YELLOW}Если ключ уже есть — вставьте его сейчас.${NC}"
-    echo -e "${YELLOW}Или нажмите Enter, чтобы заполнить вручную позже.${NC}"
-    echo ""
+        read -rp "$(echo -e "${YELLOW}SECRET_KEY${NC} (или Enter для пропуска): ")" SECRET_KEY < /dev/tty
+    fi
 
-    read -rp "$(echo -e "${YELLOW}SECRET_KEY${NC} (или Enter для пропуска): ")" secret_key < /dev/tty
-
+    local secret_key="$SECRET_KEY"
     if [[ -z "$secret_key" ]]; then
         secret_key="REPLACE_WITH_SECRET_KEY_FROM_PANEL"
         log_warning "SECRET_KEY не задан. Не забудьте заполнить его в $PROJECT_DIR/docker-compose.yml"
@@ -1270,7 +1702,7 @@ show_next_steps() {
     echo ""
 
     echo -e "${BLUE}🔒 Firewall (UFW):${NC}"
-    echo -e "   ✓ SSH ${SSH_PORTS[*]}          — разрешён (TCP)"
+    echo -e "   ✓ SSH ${SSH_PORT_LIST[*]}          — разрешён (TCP)"
     echo -e "   ✓ NODE_PORT $NODE_PORT  — только для $PANEL_NETBIRD_IP (NetBird, TCP)"
     echo -e "   ✓ XRAY_PORT $XRAY_PORT — все (TCP + UDP)"
     echo ""
@@ -1297,6 +1729,11 @@ show_next_steps() {
     echo -e "   netbird status"
     echo ""
     echo -e "${BLUE}📄 Лог установки:${NC} $LOG_FILE"
+    if [[ -f "$ENV_FILE" ]]; then
+        echo -e "${BLUE}⚙️  Конфигурация:${NC}  $ENV_FILE"
+        echo -e "   Повтор установки без вопросов:"
+        echo -e "   ${GREEN}sudo $0 --config $ENV_FILE --non-interactive${NC}"
+    fi
     echo ""
 }
 
@@ -1304,8 +1741,12 @@ show_next_steps() {
 # Точка входа
 # ─────────────────────────────────────────────────
 main() {
+    # Аргументы разбираем до всего остального, чтобы --help
+    # работал без прав root
+    parse_args "$@"
+
     echo -e "${GREEN}═══════════════════════════════════════════════════════════${NC}"
-    echo -e "${GREEN}   Remnawave Node Auto-Installer v3.1                      ${NC}"
+    echo -e "${GREEN}   Remnawave Node Auto-Installer v3.2                      ${NC}"
     echo -e "${GREEN}═══════════════════════════════════════════════════════════${NC}"
     echo ""
 
@@ -1314,8 +1755,16 @@ main() {
     check_root
     touch "$LOG_FILE"
 
+    load_env_file
     detect_arch
-    ask_params
+    resolve_params
+
+    # Параметры собраны и проверены — сохраняем их для повторного
+    # запуска. В неинтерактивном режиме файлом управляет пользователь,
+    # поэтому не трогаем его.
+    if (( NON_INTERACTIVE == 0 )); then
+        save_env_file
+    fi
 
     log "Начало установки..."
 
@@ -1338,6 +1787,12 @@ main() {
     # docker-compose.yml для ноды
     generate_docker_compose
 
+    # Повторное сохранение: SSH_PORTS и SECRET_KEY становятся
+    # известны уже после первого сохранения
+    if (( NON_INTERACTIVE == 0 )); then
+        save_env_file
+    fi
+
     # Финал
     get_netbird_ip
     show_next_steps
@@ -1345,4 +1800,4 @@ main() {
     log "Установка завершена успешно."
 }
 
-main
+main "$@"
