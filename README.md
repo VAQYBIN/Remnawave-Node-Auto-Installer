@@ -1,10 +1,14 @@
 # Скрипты автоматизации развертывания Remnawave Node
 
-[![GitHub release](https://img.shields.io/badge/version-v3.2.1-blue.svg)](https://github.com/VAQYBIN/Remnawave-Node-Auto-Installer/releases)
+[![GitHub release](https://img.shields.io/badge/version-v4.0.0-blue.svg)](https://github.com/VAQYBIN/Remnawave-Node-Auto-Installer/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Shell](https://img.shields.io/badge/Shell-Bash-green.svg)](https://www.gnu.org/software/bash/)
 
 Автоматическая установка и настройка Remnawave Node с полным стеком мониторинга (cAdvisor, Node Exporter, VictoriaMetrics Agent) и настройкой безопасности (UFW Firewall).
+
+С v4 один скрипт ставит сервер любой из трёх [ролей](#-роли-нод): входная нода
+(`entry`), выходная (`exit`) или выходная с прямыми подключениями (`exit-direct`).
+Пути, имена контейнеров и конфиги одинаковы на всех серверах.
 
 Поддерживаются архитектуры **x86_64 (amd64)** и **aarch64 (arm64)** — нужные бинарники выбираются автоматически.
 
@@ -33,6 +37,10 @@
 
 1. **setup_remnawave_node.sh** - Основной скрипт установки
 2. **check_monitoring_status.sh** - Скрипт проверки статуса мониторинга
+3. **.env.example** - Шаблон файла конфигурации
+4. **templates/** - Шаблоны nginx для ролей и сайт-заглушка. При запуске через
+   `curl | bash` скрипт сам скачивает их из репозитория
+5. **panel/** - Конфигурация панели: профили и описание ролей ([panel/README.md](panel/README.md))
 
 ---
 
@@ -66,6 +74,14 @@ sudo ./setup_remnawave_node.sh
 sudo ./setup_remnawave_node.sh --config /root/node.env --non-interactive
 ```
 
+### Вариант 4: Привести существующую ноду к стандарту роли
+
+```bash
+sudo ./setup_remnawave_node.sh --role-only --config /root/node.env
+```
+
+Подробнее — в разделе [Режим --role-only](#режим---role-only).
+
 ### Скрипт проверки статуса
 
 ```bash
@@ -76,6 +92,152 @@ chmod +x check_monitoring_status.sh
 # Запустить проверку
 sudo ./check_monitoring_status.sh
 ```
+
+---
+
+## 🎭 Роли нод
+
+Сервис построен на каскаде: клиент подключается к **входной** ноде в РФ, а она
+передаёт трафик по сети NetBird на **выходную** ноду за рубежом. Роль задаётся
+обязательным параметром `NODE_ROLE`.
+
+| | `entry` (вход, РФ) | `exit` (выход) | `exit-direct` (выход + прямые) |
+|---|---|---|---|
+| nginx | SNI-роутер на 443 + сайт-заглушка | нет | только сайт-заглушка |
+| Сертификат | да | нет | да (сайт + Hysteria2) |
+| Кто слушает 443/tcp | nginx (stream) | никто | Xray |
+| UFW, открыто для всех | 443/tcp, 80/tcp | ничего | 443/tcp, 443/udp, 8443/tcp, 80/tcp |
+| Сертификат смонтирован в remnanode | нет | нет | да |
+
+**entry.** nginx принимает 443/tcp и, не расшифровывая TLS, смотрит на SNI:
+подключения на `NODE_DOMAIN` уходят в Xray (`127.0.0.1:XRAY_LOCAL_PORT`), а все
+остальные, в том числе с чужим SNI или без него, попадают на сайт-заглушку
+(`127.0.0.1:SITE_LOCAL_PORT`). Reality использует этот же сайт как `target`,
+поэтому у сайта включены TLS 1.3, X25519 и HTTP/2. Proxy protocol не используется
+(`xver: 0`). Порт 80 только перенаправляет на `https://NODE_DOMAIN`.
+
+**exit.** Ни nginx, ни сертификата. Трафик приходит с входных нод на инбаунд
+`bridge-in` через NetBird, наружу не открыто ничего, кроме SSH.
+
+**exit-direct.** 443 слушает сам Xray, неавторизованные подключения он
+передаёт на сайт-заглушку. Сертификат смонтирован в `remnanode` для Hysteria2.
+
+**Порт моста `10443/tcp`** в UFW не открывается ни в одной роли. Мост работает
+через NetBird, а NetBird ставит свои правила файрвола раньше UFW. Итоговая
+проверка скрипта отдельно убеждается, что 10443 в UFW не разрешён.
+
+Что настроить в панели для каждой роли, скрипт выводит в конце работы.
+Подробнее о профилях и сквадах — в [panel/README.md](panel/README.md).
+
+### Единые пути и имена
+
+| Что | Путь / имя |
+|---|---|
+| remnanode | `/opt/remnanode/docker-compose.yml`, контейнер `remnanode` |
+| nginx | `/opt/nginx/nginx.conf`, `/opt/nginx/html/`, `/opt/nginx/docker-compose.yml`, контейнер `nginx` |
+| сертификаты | `/opt/certs/fullchain.pem`, `/opt/certs/privkey.key` |
+| CertWarden-клиент | `/opt/certwarden-client/docker-compose.yml`, контейнер `certwarden-client` |
+
+Правила, которым следуют все сгенерированные compose-файлы:
+
+- **Сертификаты монтируются папкой** `/opt/certs`, а не отдельными файлами. Если
+  файл заменить через переименование, отдельно смонтированный файл в контейнере
+  продолжит показывать старую версию.
+- **Никаких `ports:` на `0.0.0.0`.** Порты, опубликованные Docker, идут через
+  iptables мимо UFW и оказываются открыты всему интернету. Поэтому nginx и
+  remnanode работают в `network_mode: host`, а CertWarden-клиент публикуется
+  только на `127.0.0.1:5055`.
+- **Повторный запуск безопасен.** Перед заменой конфига старая версия сохраняется
+  в `/opt/<компонент>/backup-<дата>/`. Неизменённые файлы не трогаются. Если
+  поменялся только `nginx.conf`, nginx делает `reload`, а не перезапуск, поэтому
+  текущие подключения не рвутся.
+- **Свой сайт не перезаписывается.** Сайт-заглушка кладётся в `/opt/nginx/html/`,
+  только если папка пуста.
+
+### Сертификаты
+
+`CERT_SOURCE=certwarden` поднимает CertWarden-клиент
+(`ghcr.io/gregtwallace/certwarden-client`) по схеме с текущих серверов и ждёт,
+пока он запишет `fullchain.pem` и `privkey.key` в `/opt/certs`. После продления
+клиент перезапускает контейнер `nginx`.
+
+`remnanode` клиент **не перезапускает**: Xray сам перечитывает файлы сертификата
+раз в час, а перезапуск ноды оборвал бы все подключения.
+
+`CERT_SOURCE=manual` предполагает, что файлы вы кладёте сами, например
+wildcard-сертификат:
+
+```bash
+mkdir -p /opt/certs
+cp fullchain.pem /opt/certs/fullchain.pem   # сертификат с цепочкой
+cp privkey.key   /opt/certs/privkey.key     # приватный ключ
+```
+
+В обоих случаях скрипт проверяет:
+- файлы есть и читаются;
+- сертификат не просрочен (`openssl x509 -checkend`);
+- ключ подходит к сертификату;
+- сертификат покрывает `NODE_DOMAIN`.
+
+Если что-то не так, скрипт останавливается и пишет, что и куда положить. Права на
+`privkey.key` выставляются `600`. В конце выводятся срок действия и SAN.
+
+### Предпроверки
+
+Предпроверки выполняются до любых изменений на сервере. Скрипт **ничего не
+останавливает сам**: если порт занят, он показывает процесс (`ss -tlnp`) и
+завершается.
+
+- **443/tcp и 80/tcp** (`entry`, `exit-direct`). Порт может держать только
+  собственный контейнер роли: `nginx` или, для 443 на `exit-direct`,
+  `remnanode`.
+- **SITE_LOCAL_PORT**, а на `entry` ещё и **XRAY_LOCAL_PORT**.
+- **5055/tcp** для CertWarden-клиента.
+- **Контейнеры `remnanode`, `nginx`, `certwarden-client`**. Если контейнер с
+  таким именем создан из другой папки, docker compose не сможет им управлять,
+  и скрипт тоже остановится.
+- **Старые контейнеры** ручной установки (`remnawave-nginx`, `certwardenclient`):
+  о них скрипт только предупреждает.
+
+### Режим --role-only
+
+`--role-only` выполняет только ролевую часть:
+- сертификат;
+- nginx;
+- `docker-compose.yml` remnanode;
+- правила UFW;
+- итоговую проверку.
+
+Обновление системы, NetBird, Docker и мониторинг не трогаются, поэтому
+`NETBIRD_SETUP_KEY`, `INSTANCE_NAME` и `VICTORIA_METRICS_URL` в этом режиме не нужны.
+Режим нужен, чтобы привести к стандарту уже работающие ноды без переустановки.
+
+- `SECRET_KEY` берётся из существующего `/opt/remnanode/docker-compose.yml`,
+  если его нет в конфигурации.
+- Правила UFW, которые ставил скрипт (в том числе `Xray TCP`/`Xray UDP` из v3),
+  но которых нет в наборе роли, удаляются. SSH, NODE_PORT и правила,
+  добавленные вручную, остаются.
+- Старые контейнеры (`remnawave-nginx`, `certwardenclient`) нужно остановить
+  вручную. Пока они держат 443 или 5055, предпроверка не пройдёт.
+
+```bash
+# пример для существующей входной ноды
+docker stop remnawave-nginx certwardenclient
+sudo ./setup_remnawave_node.sh --role-only --config /root/node.env
+# убедившись, что всё работает:
+docker rm remnawave-nginx certwardenclient
+```
+
+### Итоговая проверка
+
+В конце скрипт выводит отчёт по пунктам с ✓ / ✗:
+- запущены контейнеры роли;
+- `entry`: nginx слушает `0.0.0.0:443` и `0.0.0.0:80`, сайт на
+  `127.0.0.1:SITE_LOCAL_PORT` отвечает по TLS 1.3 с ALPN h2 и валидным
+  для `NODE_DOMAIN` сертификатом, а 443 с чужим SNI отдаёт сайт;
+- `exit-direct`: сайт отвечает, файлы сертификата видны внутри `remnanode`;
+- `10443` не разрешён в UFW;
+- NetBird подключён, выводятся NetBird IP и FQDN.
 
 ---
 
@@ -98,7 +260,12 @@ sudo ./check_monitoring_status.sh
 медленной загрузке, а не их сумме.
 
 #### Конфигурация ноды:
-8. 📄 Генерация `/opt/remnanode/docker-compose.yml` по шаблону
+8. 📄 Генерация `/opt/remnanode/docker-compose.yml` (образ `remnawave/node:REMNANODE_VERSION`)
+   и запуск ноды, если задан `SECRET_KEY`
+
+#### Роль (`entry`, `exit-direct`):
+9. 🔐 Сертификат в `/opt/certs` — CertWarden-клиент или файлы вручную
+10. 🌐 nginx (`nginx:alpine`, `network_mode: host`) по шаблону роли и сайт-заглушка
 
 ### Интерактивные параметры:
 
@@ -106,12 +273,14 @@ sudo ./check_monitoring_status.sh
 см. [Неинтерактивный режим](#-неинтерактивный-режим).
 
 В начале работы скрипт запросит:
+- **Роль ноды** — `entry`, `exit` или `exit-direct`
 - **NetBird Setup Key** (получить в панели NetBird: https://app.netbird.io/)
 - **Название инстанса** (например: `de-node-01`, `ru-moscow-01`)
 - **IP/URL Victoria Metrics** (например: `10.0.0.1` или `http://10.0.0.1:8428` - формат будет автоматически проверен)
 - **NODE_PORT для связи с панелью** (по умолчанию: `2222`)
-- **XRAY_PORT для входящих VPN подключений** (по умолчанию: `443`)
 - **NetBird IP панели Remnawave** — адрес панели **внутри mesh-сети** (обычно `100.x.x.x`), а не её публичный IP
+- Для `entry` и `exit-direct`: **домен ноды**, **источник сертификата** и, для
+  CertWarden, имена и ключи сертификата
 
 Ещё два вопроса задаются по ходу установки:
 - **Подтверждение SSH-портов** перед включением UFW (см. ниже)
@@ -130,7 +299,7 @@ sudo ./check_monitoring_status.sh
   показывается и требует подтверждения **до** включения UFW — можно отменить установку
   или задать порты вручную. Нестандартный SSH-порт больше не приводит к потере доступа.
 - Разрешается доступ с NetBird IP панели на NODE_PORT (только TCP)
-- Разрешается XRAY_PORT для всех входящих (TCP + UDP)
+- Публичные порты задаёт роль (см. [Роли нод](#-роли-нод)); `10443` не открывается никогда
 - UFW автоматически активируется
 
 **🌐 NetBird:**
@@ -148,7 +317,17 @@ sudo ./check_monitoring_status.sh
 ```
 /opt/
 ├── remnanode/
-│   └── docker-compose.yml  # Генерируется скриптом
+│   ├── docker-compose.yml  # Генерируется скриптом (chmod 600, в нём SECRET_KEY)
+│   └── backup-<дата>/      # Предыдущие версии при повторном запуске
+├── nginx/                  # entry, exit-direct
+│   ├── nginx.conf
+│   ├── html/index.html     # Сайт-заглушка
+│   └── docker-compose.yml
+├── certs/                  # entry, exit-direct
+│   ├── fullchain.pem
+│   └── privkey.key         # chmod 600
+├── certwarden-client/      # CERT_SOURCE=certwarden
+│   └── docker-compose.yml  # chmod 600, в нём ключи CertWarden
 └── monitoring/
     ├── cadvisor/
     │   └── cadvisor        # Бинарник cAdvisor
@@ -370,7 +549,8 @@ journalctl -u netbird -f
    # заменить REPLACE_WITH_SECRET_KEY_FROM_PANEL на ключ из панели
    ```
 
-5. **Запустить контейнер**
+5. **Запустить контейнер** — если SECRET_KEY был известен скрипту, нода уже
+   запущена. Иначе:
    ```bash
    cd /opt/remnanode
    docker compose up -d
@@ -379,8 +559,10 @@ journalctl -u netbird -f
 
 6. **Завершить в панели**
    - Нажать "Next"
-   - Выбрать Config Profile
+   - Выбрать Config Profile роли: `entry-ru`, `exit` или `exit-direct`
    - Нажать "Create"
+   - Выполнить шаги роли из подсказки в конце вывода скрипта
+     (см. также [panel/README.md](panel/README.md))
 
 7. **✅ Готово!** Firewall уже настроен автоматически скриптом
 
@@ -404,6 +586,8 @@ journalctl -u netbird -f
                        (по умолчанию: /opt/remnawave-installer/.env)
 -n, --non-interactive  Не задавать вопросов. При нехватке обязательных
                        параметров скрипт завершится с ошибкой
+    --role-only        Только ролевая часть, без системы, NetBird, Docker
+                       и мониторинга
     --no-save-env      Не сохранять введённые ответы в файл конфигурации
 -h, --help             Показать справку
 ```
@@ -421,14 +605,32 @@ nano /opt/remnawave-installer/.env
 
 | Параметр | Обязательный | Описание |
 |---|:---:|---|
-| `NETBIRD_SETUP_KEY` | да | Ключ из панели app.netbird.io |
-| `INSTANCE_NAME` | да | Имя ноды в метриках, **уникальное** для каждой ноды |
-| `VICTORIA_METRICS_URL` | да | IP или URL Victoria Metrics |
+| `NODE_ROLE` | да | `entry`, `exit` или `exit-direct` |
+| `NETBIRD_SETUP_KEY` | да¹ | Ключ из панели app.netbird.io |
+| `INSTANCE_NAME` | да¹ | Имя ноды в метриках, **уникальное** для каждой ноды |
+| `VICTORIA_METRICS_URL` | да¹ | IP или URL Victoria Metrics |
 | `PANEL_NETBIRD_IP` | да | NetBird IP панели (`100.x.x.x`), не публичный |
+| `NODE_DOMAIN` | entry, exit-direct | Домен ноды, например `ru03.example.org` |
+| `CERT_SOURCE` | entry, exit-direct | `certwarden` или `manual` |
+| `CW_CLIENT_SERVER_ADDRESS` | certwarden | Адрес сервера CertWarden, `https://...` |
+| `CW_CLIENT_CERT_NAME`, `CW_CLIENT_CERT_APIKEY` | certwarden | Имя сертификата и его API-ключ |
+| `CW_CLIENT_KEY_NAME`, `CW_CLIENT_KEY_APIKEY` | certwarden | Имя ключа и его API-ключ |
+| `CW_CLIENT_AES_KEY_BASE64` | certwarden | AES-ключ из Post Processing |
+| `CW_CLIENT_FILE_UPDATE_TIME_START` / `_END` | нет | Окно обновления файлов, по умолчанию `02:00`–`03:00` |
+| `CW_CLIENT_FILE_UPDATE_DAYS_OF_WEEK` | нет | Дни недели, по умолчанию все |
+| `TZ` | нет | Часовой пояс окна, по умолчанию `Europe/Moscow` |
+| `REMNANODE_VERSION` | нет | Тег `remnawave/node`, по умолчанию `3.4.3`; `latest` не принимается |
+| `XRAY_LOCAL_PORT` | нет | entry: порт Reality на 127.0.0.1, по умолчанию `10443` |
+| `SITE_LOCAL_PORT` | нет | Порт сайта-заглушки на 127.0.0.1, по умолчанию `9443` |
 | `NODE_PORT` | нет | Порт связи с панелью, по умолчанию `2222` |
-| `XRAY_PORT` | нет | Порт VPN-подключений, по умолчанию `443` |
 | `SSH_PORTS` | нет | Порты SSH через пробел; пусто — автоопределение |
-| `SECRET_KEY` | нет | Ключ ноды из панели; пусто — плейсхолдер |
+| `SECRET_KEY` | нет | Ключ ноды из панели; пусто — ключ из существующего compose или плейсхолдер |
+
+¹ Не нужны с `--role-only`.
+
+`XRAY_PORT` из v3 больше не используется: нода такую переменную не читает (порты
+Xray задаёт профиль в панели), а правила UFW теперь определяет роль. Если он
+остался в старом `.env`, скрипт предупредит и проигнорирует его.
 
 Файл не исполняется скриптом, а разбирается построчно: произвольный код в нём
 не выполнится, а неизвестные ключи будут пропущены с предупреждением.
@@ -486,7 +688,8 @@ NETBIRD_SETUP_KEY="nbp_reusable_key"
 VICTORIA_METRICS_URL="100.64.0.1"
 PANEL_NETBIRD_IP="100.64.0.5"
 NODE_PORT="2222"
-XRAY_PORT="443"
+NODE_ROLE="exit"
+REMNANODE_VERSION="3.4.3"
 SSH_PORTS="22"
 ```
 
@@ -697,9 +900,45 @@ systemctl status cadvisor
 
 Аналогично для Node Exporter и vmagent.
 
+### Обновление remnanode:
+
+Версия образа задаётся `REMNANODE_VERSION` в `.env`, тег без `v`, например `3.4.4`
+(список: [Docker Hub](https://hub.docker.com/r/remnawave/node/tags)). После
+изменения:
+
+```bash
+sudo ./setup_remnawave_node.sh --role-only --config /opt/remnawave-installer/.env
+```
+
+Скрипт сохранит старый `docker-compose.yml` в `backup-<дата>/` и пересоздаст
+контейнер с новой версией.
+
 ---
 
 ## 📝 Changelog
+
+### v4.0.0
+- ✨ **Роли нод** `NODE_ROLE`: `entry`, `exit`, `exit-direct`. Роль задаёт nginx,
+  сертификат, монтирования remnanode и публичные порты UFW
+- ✨ Единые пути и имена контейнеров на всех серверах: `/opt/remnanode`, `/opt/nginx`,
+  `/opt/certs`, `/opt/certwarden-client`. Раньше имена nginx на серверах различались,
+  CertWarden-клиент мог перезапускать не тот контейнер, и новый сертификат не
+  подхватывался
+- ✨ nginx по шаблонам из `templates/nginx/`: SNI-роутер на 443 для `entry`, сайт-заглушка
+  с TLS 1.3, X25519 и HTTP/2 для Reality, редирект с 80
+- ✨ Сертификаты: CertWarden-клиент или файлы, положенные вручную. Проверка срока,
+  соответствия ключа и домена
+- ✨ Режим `--role-only` для приведения существующих нод к стандарту
+- ✨ Предпроверки занятых портов и чужих контейнеров до любых изменений
+- ✨ Итоговая проверка с отчётом ✓ / ✗ и подсказкой, что сделать в панели
+- 🔧 Образ `remnawave/node` фиксируется по версии (`REMNANODE_VERSION`), `latest` больше
+  не используется
+- 🔧 Конфиги перед заменой сохраняются в `/opt/<компонент>/backup-<дата>/`
+- 🔧 `SECRET_KEY` при повторном запуске берётся из существующего compose-файла, а не
+  затирается плейсхолдером. Compose-файлы с секретами получают `chmod 600`
+- 🔧 Если `SECRET_KEY` известен, remnanode запускается сразу
+- ⚠️ `XRAY_PORT` удалён: нода такую переменную не читает. Порты UFW теперь задаёт роль,
+  правила `Xray TCP`/`Xray UDP` из v3 вне роли удаляются
 
 ### v3.2.1
 - 🐛 **Установка больше не требует `wget`.** На минимальных образах Ubuntu/Debian

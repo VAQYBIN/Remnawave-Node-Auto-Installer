@@ -2,7 +2,20 @@
 
 #####################################################
 # Скрипт автоматической настройки Remnawave Node
-# Версия: 3.2.1
+# Версия: 4.0.0
+#
+# Новое в v4.0:
+#   - Роли нод (NODE_ROLE): entry, exit, exit-direct. Роль задаёт
+#     nginx, сертификаты, монтирования remnanode и правила UFW
+#   - Единые пути и имена контейнеров на всех серверах:
+#     /opt/remnanode, /opt/nginx, /opt/certs, /opt/certwarden-client
+#   - Сертификаты: CertWarden-клиент или файлы, положенные вручную
+#   - Режим --role-only: только ролевая часть на настроенном сервере
+#   - Версия образа remnawave/node фиксируется (REMNANODE_VERSION)
+#   - XRAY_PORT удалён: нода такую переменную не читает, порты
+#     Xray задаются профилем в панели, правила UFW — ролью
+#   - Итоговая проверка с отчётом ✓ / ✗ и подсказкой для панели
+#   - Конфиги перед заменой сохраняются в /opt/<компонент>/backup-<дата>/
 #
 # Исправления в v3.2.1:
 #   - Установка больше не требует wget: загрузчик выбирается по
@@ -65,6 +78,37 @@ PROJECT_DIR="/opt/remnanode"
 MONITORING_DIR="/opt/monitoring"
 LOG_FILE="/var/log/remnawave_setup.log"
 
+# Ролевые компоненты. Пути и имена контейнеров одинаковы на всех
+# серверах: на них завязаны CertWarden-клиент (кого перезапускать
+# после продления) и профили в панели (где лежит сертификат).
+#
+# Правило для всех compose-файлов: никаких ports: на 0.0.0.0.
+# Опубликованные Docker порты идут через iptables мимо UFW и были бы
+# открыты всему интернету. Только network_mode: host (тогда порты
+# закрывает UFW) или публикация на 127.0.0.1.
+NGINX_DIR="/opt/nginx"
+CERTS_DIR="/opt/certs"
+CERTWARDEN_DIR="/opt/certwarden-client"
+CERT_FULLCHAIN="fullchain.pem"
+CERT_PRIVKEY="privkey.key"
+
+# Куда сертификат монтируется в remnanode (роль exit-direct):
+# по этому пути профиль Hysteria2 в панели ищет fullchain.pem и privkey.key
+REMNANODE_SSL_DIR="/var/lib/remnawave/configs/xray/ssl"
+
+# Образы ролевых компонентов
+NGINX_IMAGE="nginx:alpine"
+CERTWARDEN_IMAGE="ghcr.io/gregtwallace/certwarden-client:v0.5.0"
+
+# Откуда брать шаблоны, если скрипт запущен не из клона репозитория
+# (curl ... | bash). Ветку можно переопределить для проверки
+# неслитых изменений: REMNAWAVE_INSTALLER_REF=feature/v4-roles
+INSTALLER_REF="${REMNAWAVE_INSTALLER_REF:-main}"
+TEMPLATES_URL="https://raw.githubusercontent.com/VAQYBIN/Remnawave-Node-Auto-Installer/${INSTALLER_REF}/templates"
+
+# Метка для резервных копий конфигов — одна на весь запуск
+BACKUP_STAMP="$(date +%Y%m%d-%H%M%S)"
+
 # Временная директория для параллельных загрузок
 TMP_DIR="/tmp/remnawave_setup_$$"
 
@@ -95,20 +139,52 @@ NETBIRD_SETUP_KEY="${NETBIRD_SETUP_KEY:-}"
 INSTANCE_NAME="${INSTANCE_NAME:-}"
 VICTORIA_METRICS_URL="${VICTORIA_METRICS_URL:-}"
 NODE_PORT="${NODE_PORT:-}"
-XRAY_PORT="${XRAY_PORT:-}"
 PANEL_NETBIRD_IP="${PANEL_NETBIRD_IP:-}"   # NetBird IP панели (100.x.x.x), а не публичный
 SSH_PORTS="${SSH_PORTS:-}"                 # строка "22 2233"; пусто — автоопределение
 SECRET_KEY="${SECRET_KEY:-}"               # выдаётся панелью при создании ноды
 
+# Роль ноды и её параметры
+NODE_ROLE="${NODE_ROLE:-}"                 # entry | exit | exit-direct
+NODE_DOMAIN="${NODE_DOMAIN:-}"             # entry, exit-direct
+CERT_SOURCE="${CERT_SOURCE:-}"             # certwarden | manual
+REMNANODE_VERSION="${REMNANODE_VERSION:-}" # тег образа remnawave/node
+XRAY_LOCAL_PORT="${XRAY_LOCAL_PORT:-}"     # entry: Reality-инбаунд на 127.0.0.1
+SITE_LOCAL_PORT="${SITE_LOCAL_PORT:-}"     # entry, exit-direct: сайт на 127.0.0.1
+
+# Параметры CertWarden-клиента. Имена совпадают с переменными
+# окружения самого клиента и передаются ему как есть.
+CW_CLIENT_SERVER_ADDRESS="${CW_CLIENT_SERVER_ADDRESS:-}"
+CW_CLIENT_AES_KEY_BASE64="${CW_CLIENT_AES_KEY_BASE64:-}"
+CW_CLIENT_KEY_NAME="${CW_CLIENT_KEY_NAME:-}"
+CW_CLIENT_KEY_APIKEY="${CW_CLIENT_KEY_APIKEY:-}"
+CW_CLIENT_CERT_NAME="${CW_CLIENT_CERT_NAME:-}"
+CW_CLIENT_CERT_APIKEY="${CW_CLIENT_CERT_APIKEY:-}"
+CW_CLIENT_FILE_UPDATE_TIME_START="${CW_CLIENT_FILE_UPDATE_TIME_START:-}"
+CW_CLIENT_FILE_UPDATE_TIME_END="${CW_CLIENT_FILE_UPDATE_TIME_END:-}"
+CW_CLIENT_FILE_UPDATE_DAYS_OF_WEEK="${CW_CLIENT_FILE_UPDATE_DAYS_OF_WEEK:-}"
+TZ="${TZ:-}"                               # часовой пояс окна обновления файлов
+
 # Значения по умолчанию для необязательных параметров
 DEFAULT_NODE_PORT="2222"
-DEFAULT_XRAY_PORT="443"
+DEFAULT_REMNANODE_VERSION="3.4.3"
+DEFAULT_XRAY_LOCAL_PORT="10443"
+DEFAULT_SITE_LOCAL_PORT="9443"
+DEFAULT_CW_TIME_START="02:00"
+DEFAULT_CW_TIME_END="03:00"
+DEFAULT_CW_DAYS="Mon Tue Wed Thu Fri Sat Sun"
+DEFAULT_TZ="Europe/Moscow"
+
+# Порт моста (инбаунд bridge-in на выходах). Работает только через
+# NetBird, в UFW не открывается ни в одной роли.
+BRIDGE_PORT="10443"
 
 # Вычисляются в процессе работы
 NETBIRD_IP=""
+NETBIRD_FQDN=""
 ARCH_SUFFIX=""        # Определяется автоматически
 SSH_PORT_LIST=()      # Итоговый список портов для правил UFW
 DOWNLOADER=""         # "curl" или "wget" — выбирается по факту наличия
+NGINX_CONF_CHANGED=0  # nginx.conf изменился — нужен reload
 
 # ─────────────────────────────────────────────────
 # Режим работы
@@ -116,6 +192,7 @@ DOWNLOADER=""         # "curl" или "wget" — выбирается по фа�
 ENV_FILE="${REMNAWAVE_ENV_FILE:-/opt/remnawave-installer/.env}"
 NON_INTERACTIVE=0
 SAVE_ENV=1
+ROLE_ONLY=0           # --role-only: без системы, NetBird, Docker, мониторинга
 
 # Белый список параметров, распознаваемых в файле конфигурации.
 # Всё остальное игнорируется с предупреждением — это ловит опечатки
@@ -126,10 +203,31 @@ ENV_KEYS=(
     INSTANCE_NAME
     VICTORIA_METRICS_URL
     NODE_PORT
-    XRAY_PORT
     PANEL_NETBIRD_IP
     SSH_PORTS
     SECRET_KEY
+    NODE_ROLE
+    NODE_DOMAIN
+    CERT_SOURCE
+    REMNANODE_VERSION
+    XRAY_LOCAL_PORT
+    SITE_LOCAL_PORT
+    CW_CLIENT_SERVER_ADDRESS
+    CW_CLIENT_AES_KEY_BASE64
+    CW_CLIENT_KEY_NAME
+    CW_CLIENT_KEY_APIKEY
+    CW_CLIENT_CERT_NAME
+    CW_CLIENT_CERT_APIKEY
+    CW_CLIENT_FILE_UPDATE_TIME_START
+    CW_CLIENT_FILE_UPDATE_TIME_END
+    CW_CLIENT_FILE_UPDATE_DAYS_OF_WEEK
+    TZ
+)
+
+# Параметры прошлых версий: в файле конфигурации не считаются
+# опечаткой, но игнорируются с пояснением
+DEPRECATED_ENV_KEYS=(
+    XRAY_PORT   # v3: нода его не читает, UFW теперь задаёт роль
 )
 
 # Метод проверки APT-блокировки: "fuser" или "proc".
@@ -179,27 +277,69 @@ Remnawave Node Auto-Installer
                         (по умолчанию: /opt/remnawave-installer/.env)
   -n, --non-interactive Не задавать вопросов. При нехватке обязательных
                         параметров скрипт завершится с ошибкой
+      --role-only       Только ролевая часть: nginx, сертификаты,
+                        remnanode, UFW. Без обновления системы, NetBird,
+                        Docker и мониторинга — для приведения к стандарту
+                        уже настроенных нод. NetBird и Docker должны
+                        быть установлены
       --no-save-env     Не сохранять введённые ответы в файл конфигурации
   -h, --help            Показать эту справку
+
+Роли (NODE_ROLE):
+
+  entry        Входная нода (РФ). nginx принимает 443/tcp и разводит
+               по SNI: NODE_DOMAIN → Xray (127.0.0.1:XRAY_LOCAL_PORT),
+               остальное → сайт-заглушка (127.0.0.1:SITE_LOCAL_PORT).
+               Сертификат нужен. Открыто для всех: 443/tcp, 80/tcp
+
+  exit         Выходная нода. Трафик приходит с входных нод по NetBird.
+               Без nginx и сертификата. Открытых для всех портов нет
+
+  exit-direct  Выходная нода с прямыми подключениями и Hysteria2.
+               443 слушает Xray, nginx держит только сайт-заглушку.
+               Сертификат монтируется в remnanode. Открыто для всех:
+               443/tcp, 443/udp, 8443/tcp, 80/tcp
+
+  Порт моста 10443/tcp не открывается ни в одной роли: мост
+  работает через NetBird.
 
 Параметры конфигурации (файл .env или переменные окружения):
 
   Обязательные:
-    NETBIRD_SETUP_KEY     Ключ из панели app.netbird.io
-    INSTANCE_NAME         Имя ноды для метрик, например de-node-01
-    VICTORIA_METRICS_URL  IP или URL Victoria Metrics
+    NODE_ROLE             entry | exit | exit-direct
     PANEL_NETBIRD_IP      NetBird IP панели Remnawave (100.x.x.x)
+    NETBIRD_SETUP_KEY     Ключ из панели app.netbird.io  ┐ не нужны
+    INSTANCE_NAME         Имя ноды для метрик            │ с --role-only
+    VICTORIA_METRICS_URL  IP или URL Victoria Metrics    ┘
+
+  Для ролей entry и exit-direct:
+    NODE_DOMAIN           Домен ноды, например ru03.example.org
+    CERT_SOURCE           certwarden | manual
+                          manual: fullchain.pem и privkey.key заранее
+                          положить в /opt/certs
+    CW_CLIENT_*, TZ       Параметры CertWarden-клиента (CERT_SOURCE=
+                          certwarden), см. .env.example
 
   Необязательные:
     NODE_PORT             Порт для связи с панелью (по умолчанию 2222)
-    XRAY_PORT             Порт входящих VPN-подключений (по умолчанию 443)
+    REMNANODE_VERSION     Тег образа remnawave/node (по умолчанию 3.4.3)
+    XRAY_LOCAL_PORT       entry: порт Reality на 127.0.0.1 (по умолчанию 10443)
+    SITE_LOCAL_PORT       Порт сайта-заглушки на 127.0.0.1 (по умолчанию 9443)
     SSH_PORTS             Порты SSH через пробел, например "22 2233".
                           Если не задан — определяются автоматически
     SECRET_KEY            Ключ ноды из панели. Если не задан, в
                           docker-compose.yml пишется плейсхолдер
+                          (или сохраняется ключ из существующего файла)
 
 Приоритет источников: переменная окружения → файл конфигурации →
 значение по умолчанию → интерактивный вопрос.
+
+Единые пути:
+  /opt/remnanode/docker-compose.yml        контейнер remnanode
+  /opt/nginx/{nginx.conf,html/,docker-compose.yml}   контейнер nginx
+  /opt/certs/{fullchain.pem,privkey.key}   сертификат
+  /opt/certwarden-client/docker-compose.yml   контейнер certwarden-client
+  Заменяемые конфиги сохраняются в /opt/<компонент>/backup-<дата>/
 
 Примеры:
   # Обычная интерактивная установка; ответы сохранятся в .env
@@ -207,6 +347,9 @@ Remnawave Node Auto-Installer
 
   # Полностью автоматическая установка из файла
   sudo ./setup_remnawave_node.sh --config /root/node.conf --non-interactive
+
+  # Привести существующую ноду к стандарту роли
+  sudo ./setup_remnawave_node.sh --role-only --config /root/node.conf
 
   # Общие параметры в файле, уникальные — через окружение
   sudo INSTANCE_NAME=de-node-02 SECRET_KEY=xxx \
@@ -243,6 +386,10 @@ parse_args() {
                 SAVE_ENV=0
                 shift
                 ;;
+            --role-only)
+                ROLE_ONLY=1
+                shift
+                ;;
             -h|--help)
                 usage
                 exit 0
@@ -269,6 +416,14 @@ parse_args() {
 is_known_env_key() {
     local candidate="$1" key
     for key in "${ENV_KEYS[@]}"; do
+        [[ "$key" == "$candidate" ]] && return 0
+    done
+    return 1
+}
+
+is_deprecated_env_key() {
+    local candidate="$1" key
+    for key in "${DEPRECATED_ENV_KEYS[@]}"; do
         [[ "$key" == "$candidate" ]] && return 0
     done
     return 1
@@ -322,6 +477,11 @@ load_env_file() {
         value="${value%"${value##*[![:space:]]}"}"
         if [[ "$value" =~ ^\"(.*)\"$ ]] || [[ "$value" =~ ^\'(.*)\'$ ]]; then
             value="${BASH_REMATCH[1]}"
+        fi
+
+        if is_deprecated_env_key "$key"; then
+            log_warning "$ENV_FILE, строка $lineno: параметр '$key' устарел (v3) и игнорируется — порты UFW теперь задаёт NODE_ROLE"
+            continue
         fi
 
         if ! is_known_env_key "$key"; then
@@ -453,6 +613,8 @@ ensure_dependencies() {
     local missing_pkgs=()
     [[ -z "$DOWNLOADER" ]] && missing_pkgs+=("curl")
     command -v tar &> /dev/null || missing_pkgs+=("tar")
+    # openssl — проверка сертификата и итоговая проверка сайта
+    command -v openssl &> /dev/null || missing_pkgs+=("openssl")
 
     if (( ${#missing_pkgs[@]} > 0 )); then
         log_warning "Отсутствуют: ${missing_pkgs[*]} — устанавливаем"
@@ -650,6 +812,167 @@ check_panel_ip() {
 }
 
 # ─────────────────────────────────────────────────
+# Проверки ролей
+# ─────────────────────────────────────────────────
+validate_role() {
+    [[ "$1" == "entry" || "$1" == "exit" || "$1" == "exit-direct" ]]
+}
+
+# Роли с nginx, сайтом-заглушкой и сертификатом
+role_has_site() {
+    [[ "$NODE_ROLE" == "entry" || "$NODE_ROLE" == "exit-direct" ]]
+}
+
+# Домен в нижнем регистре: метки из букв, цифр и дефисов.
+# Строгая проверка нужна ещё и потому, что значение подставляется
+# в шаблон nginx через sed.
+validate_domain() {
+    [[ "$1" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$ ]]
+}
+
+# ─────────────────────────────────────────────────
+# Обязательный текстовый параметр роли
+#
+# Аргументы: имя переменной, имя массива недостающих, подсказка,
+# необязательный флаг "secret" — тогда ввод не отображается.
+# ─────────────────────────────────────────────────
+require_param() {
+    local var="$1" hint="$3" secret="${4:-}"
+    local -n missing_list="$2"
+    local input=""
+
+    [[ -n "${!var:-}" ]] && return 0
+
+    if (( NON_INTERACTIVE == 1 )); then
+        missing_list+=("$var — $hint")
+        return 0
+    fi
+
+    while [[ -z "$input" ]]; do
+        if [[ "$secret" == "secret" ]]; then
+            read -rsp "$(echo -e "${YELLOW}${var}${NC} (${hint}, ввод скрыт): ")" input < /dev/tty
+            echo ""
+        else
+            read -rp "$(echo -e "${YELLOW}${var}${NC} (${hint}): ")" input < /dev/tty
+        fi
+        [[ -z "$input" ]] && echo -e "${RED}Поле обязательно для заполнения${NC}"
+    done
+    printf -v "$var" '%s' "$input"
+}
+
+# ─────────────────────────────────────────────────
+# Локальный порт с значением по умолчанию (без вопроса)
+# Аргументы: имя переменной, значение по умолчанию
+# ─────────────────────────────────────────────────
+resolve_local_port() {
+    local var="$1" default="$2"
+
+    printf -v "$var" '%s' "${!var:-$default}"
+    if ! validate_port "${!var}"; then
+        log_error "Некорректное значение $var='${!var}' (ожидается 1–65535)"
+        exit 1
+    fi
+    if [[ "${!var}" == "443" || "${!var}" == "80" ]]; then
+        log_error "$var=${!var}: порты 443 и 80 заняты публичными слушателями роли"
+        exit 1
+    fi
+}
+
+# ─────────────────────────────────────────────────
+# Параметры ролей entry и exit-direct: домен, сертификат,
+# локальные порты. Аргумент — имя массива недостающих параметров.
+# ─────────────────────────────────────────────────
+resolve_role_params() {
+    local missing_name="$1"
+    local -n missing_role="$1"
+
+    # ─── NODE_DOMAIN ───
+    NODE_DOMAIN="${NODE_DOMAIN,,}"
+    if [[ -n "$NODE_DOMAIN" ]] && ! validate_domain "$NODE_DOMAIN"; then
+        if (( NON_INTERACTIVE == 1 )); then
+            log_error "Некорректный NODE_DOMAIN='$NODE_DOMAIN' (ожидается домен, например ru03.example.org)"
+            exit 1
+        fi
+        log_warning "Некорректный NODE_DOMAIN='$NODE_DOMAIN' — запросим заново"
+        NODE_DOMAIN=""
+    fi
+    if [[ -z "$NODE_DOMAIN" ]]; then
+        if (( NON_INTERACTIVE == 1 )); then
+            missing_role+=("NODE_DOMAIN — домен ноды, например ru03.example.org (роль $NODE_ROLE)")
+        else
+            while [[ -z "$NODE_DOMAIN" ]]; do
+                read -rp "$(echo -e "${YELLOW}NODE_DOMAIN${NC} (домен ноды, например ru03.example.org): ")" NODE_DOMAIN < /dev/tty
+                NODE_DOMAIN="${NODE_DOMAIN,,}"
+                if ! validate_domain "$NODE_DOMAIN"; then
+                    echo -e "${RED}Некорректный домен${NC}"
+                    NODE_DOMAIN=""
+                fi
+            done
+        fi
+    fi
+
+    # ─── Локальные порты ───
+    resolve_local_port SITE_LOCAL_PORT "$DEFAULT_SITE_LOCAL_PORT"
+    if [[ "$NODE_ROLE" == "entry" ]]; then
+        resolve_local_port XRAY_LOCAL_PORT "$DEFAULT_XRAY_LOCAL_PORT"
+        if [[ "$XRAY_LOCAL_PORT" == "$SITE_LOCAL_PORT" ]]; then
+            log_error "XRAY_LOCAL_PORT и SITE_LOCAL_PORT совпадают ($SITE_LOCAL_PORT)"
+            exit 1
+        fi
+    fi
+
+    # ─── CERT_SOURCE ───
+    if [[ -n "$CERT_SOURCE" && "$CERT_SOURCE" != "certwarden" && "$CERT_SOURCE" != "manual" ]]; then
+        if (( NON_INTERACTIVE == 1 )); then
+            log_error "Некорректный CERT_SOURCE='$CERT_SOURCE' (ожидается certwarden или manual)"
+            exit 1
+        fi
+        log_warning "Некорректный CERT_SOURCE='$CERT_SOURCE' — запросим заново"
+        CERT_SOURCE=""
+    fi
+    if [[ -z "$CERT_SOURCE" ]]; then
+        if (( NON_INTERACTIVE == 1 )); then
+            missing_role+=("CERT_SOURCE — certwarden или manual (роль $NODE_ROLE)")
+            return 0
+        fi
+        echo -e "${CYAN}Источник сертификата:${NC}"
+        echo -e "  ${GREEN}certwarden${NC} — CertWarden-клиент сам получает и продлевает сертификат"
+        echo -e "  ${GREEN}manual${NC}     — вы кладёте ${CERT_FULLCHAIN} и ${CERT_PRIVKEY} в ${CERTS_DIR}"
+        while [[ "$CERT_SOURCE" != "certwarden" && "$CERT_SOURCE" != "manual" ]]; do
+            read -rp "$(echo -e "${YELLOW}CERT_SOURCE${NC} [certwarden/manual]: ")" CERT_SOURCE < /dev/tty
+        done
+    fi
+
+    [[ "$CERT_SOURCE" == "certwarden" ]] || return 0
+
+    # ─── Параметры CertWarden-клиента ───
+    require_param CW_CLIENT_SERVER_ADDRESS "$missing_name" "адрес сервера CertWarden, https://..."
+    require_param CW_CLIENT_CERT_NAME      "$missing_name" "имя сертификата в CertWarden"
+    require_param CW_CLIENT_CERT_APIKEY    "$missing_name" "API-ключ сертификата" secret
+    require_param CW_CLIENT_KEY_NAME       "$missing_name" "имя приватного ключа в CertWarden"
+    require_param CW_CLIENT_KEY_APIKEY     "$missing_name" "API-ключ приватного ключа" secret
+    require_param CW_CLIENT_AES_KEY_BASE64 "$missing_name" "AES-ключ из Post Processing сертификата" secret
+
+    if [[ -n "$CW_CLIENT_SERVER_ADDRESS" && ! "$CW_CLIENT_SERVER_ADDRESS" =~ ^https:// ]]; then
+        log_error "CW_CLIENT_SERVER_ADDRESS должен начинаться с https:// (сейчас: '$CW_CLIENT_SERVER_ADDRESS')"
+        exit 1
+    fi
+
+    CW_CLIENT_FILE_UPDATE_TIME_START="${CW_CLIENT_FILE_UPDATE_TIME_START:-$DEFAULT_CW_TIME_START}"
+    CW_CLIENT_FILE_UPDATE_TIME_END="${CW_CLIENT_FILE_UPDATE_TIME_END:-$DEFAULT_CW_TIME_END}"
+    CW_CLIENT_FILE_UPDATE_DAYS_OF_WEEK="${CW_CLIENT_FILE_UPDATE_DAYS_OF_WEEK:-$DEFAULT_CW_DAYS}"
+    TZ="${TZ:-$DEFAULT_TZ}"
+
+    local t
+    for t in "$CW_CLIENT_FILE_UPDATE_TIME_START" "$CW_CLIENT_FILE_UPDATE_TIME_END"; do
+        if [[ ! "$t" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]]; then
+            log_error "Некорректное время окна обновления CertWarden: '$t' (ожидается ЧЧ:ММ)"
+            exit 1
+        fi
+    done
+}
+
+# ─────────────────────────────────────────────────
 # Определение итоговых значений параметров
 #
 # Для каждого параметра:
@@ -668,16 +991,47 @@ resolve_params() {
 
     echo ""
     echo -e "${BLUE}╔════════════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BLUE}║         Настройка параметров Remnawave Node v3.2.1                 ║${NC}"
+    echo -e "${BLUE}║         Настройка параметров Remnawave Node v4.0.0                 ║${NC}"
     echo -e "${BLUE}╚════════════════════════════════════════════════════════════════════╝${NC}"
     echo ""
 
     if (( NON_INTERACTIVE == 1 )); then
         log_info "Неинтерактивный режим: вопросы задаваться не будут"
     fi
+    if (( ROLE_ONLY == 1 )); then
+        log_info "Режим --role-only: NetBird, Docker и мониторинг не трогаем, их параметры не нужны"
+    fi
+
+    # ─── Роль ноды ───
+    # Спрашиваем первой: от неё зависит, какие параметры нужны дальше
+    if [[ -n "$NODE_ROLE" ]] && ! validate_role "$NODE_ROLE"; then
+        if (( NON_INTERACTIVE == 1 )); then
+            log_error "Некорректное значение NODE_ROLE='$NODE_ROLE' (ожидается entry, exit или exit-direct)"
+            exit 1
+        fi
+        log_warning "Некорректное значение NODE_ROLE='$NODE_ROLE' — запросим заново"
+        NODE_ROLE=""
+    fi
+    if [[ -z "$NODE_ROLE" ]]; then
+        if (( NON_INTERACTIVE == 1 )); then
+            missing+=("NODE_ROLE — entry, exit или exit-direct")
+        else
+            echo -e "${CYAN}Роль ноды:${NC}"
+            echo -e "  ${GREEN}entry${NC}        — входная (РФ): nginx на 443 разводит по SNI, сайт-заглушка"
+            echo -e "  ${GREEN}exit${NC}         — выходная: трафик только по NetBird, наружу ничего не открыто"
+            echo -e "  ${GREEN}exit-direct${NC}  — выходная с прямыми подключениями и Hysteria2"
+            while [[ -z "$NODE_ROLE" ]]; do
+                read -rp "$(echo -e "${YELLOW}NODE_ROLE${NC} [entry/exit/exit-direct]: ")" NODE_ROLE < /dev/tty
+                if ! validate_role "$NODE_ROLE"; then
+                    echo -e "${RED}Введите entry, exit или exit-direct${NC}"
+                    NODE_ROLE=""
+                fi
+            done
+        fi
+    fi
 
     # ─── NetBird Setup Key ───
-    if [[ -z "$NETBIRD_SETUP_KEY" ]]; then
+    if (( ROLE_ONLY == 0 )) && [[ -z "$NETBIRD_SETUP_KEY" ]]; then
         if (( NON_INTERACTIVE == 1 )); then
             missing+=("NETBIRD_SETUP_KEY — ключ из панели app.netbird.io")
         else
@@ -689,7 +1043,7 @@ resolve_params() {
     fi
 
     # ─── Название инстанса ───
-    if [[ -z "$INSTANCE_NAME" ]]; then
+    if (( ROLE_ONLY == 0 )) && [[ -z "$INSTANCE_NAME" ]]; then
         if (( NON_INTERACTIVE == 1 )); then
             missing+=("INSTANCE_NAME — имя ноды для метрик, например de-node-01")
         else
@@ -703,6 +1057,8 @@ resolve_params() {
     # ─── URL Victoria Metrics ───
     if [[ -n "$VICTORIA_METRICS_URL" ]]; then
         VICTORIA_METRICS_URL=$(normalize_vm_url "$VICTORIA_METRICS_URL")
+    elif (( ROLE_ONLY == 1 )); then
+        :   # мониторинг в этом режиме не настраивается
     elif (( NON_INTERACTIVE == 1 )); then
         missing+=("VICTORIA_METRICS_URL — IP или URL Victoria Metrics")
     else
@@ -744,30 +1100,19 @@ resolve_params() {
         fi
     fi
 
-    # ─── XRAY_PORT (необязательный, есть значение по умолчанию) ───
-    if [[ -n "$XRAY_PORT" ]] && ! validate_port "$XRAY_PORT"; then
-        if (( NON_INTERACTIVE == 1 )); then
-            log_error "Некорректное значение XRAY_PORT='$XRAY_PORT' (ожидается 1–65535)"
-            exit 1
-        fi
-        log_warning "Некорректное значение XRAY_PORT='$XRAY_PORT' — запросим заново"
-        XRAY_PORT=""
+    # ─── REMNANODE_VERSION ───
+    # Без вопроса: значение по умолчанию подходит почти всегда, а
+    # latest намеренно запрещён — ноды не должны разъезжаться по версиям
+    REMNANODE_VERSION="${REMNANODE_VERSION:-$DEFAULT_REMNANODE_VERSION}"
+    if [[ ! "$REMNANODE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        log_error "Некорректный REMNANODE_VERSION='$REMNANODE_VERSION'"
+        log_error "Нужен точный тег образа remnawave/node, например ${DEFAULT_REMNANODE_VERSION} (без 'v', не latest)"
+        exit 1
     fi
-    if [[ -z "$XRAY_PORT" ]]; then
-        if (( NON_INTERACTIVE == 1 )); then
-            XRAY_PORT="$DEFAULT_XRAY_PORT"
-        else
-            while true; do
-                local xray_port_input=""
-                read -rp "$(echo -e "${YELLOW}XRAY_PORT${NC} для входящих VPN подключений [по умолчанию: ${DEFAULT_XRAY_PORT}]: ")" xray_port_input < /dev/tty
-                xray_port_input="${xray_port_input:-$DEFAULT_XRAY_PORT}"
-                if validate_port "$xray_port_input"; then
-                    XRAY_PORT="$xray_port_input"
-                    break
-                fi
-                echo -e "${RED}Некорректный порт. Введите число от 1 до 65535${NC}"
-            done
-        fi
+
+    # ─── Параметры ролей с сайтом-заглушкой ───
+    if [[ "$NODE_ROLE" == "entry" || "$NODE_ROLE" == "exit-direct" ]]; then
+        resolve_role_params missing
     fi
 
     # ─── NetBird IP панели Remnawave ───
@@ -836,11 +1181,25 @@ resolve_params() {
 
     echo ""
     echo -e "${CYAN}──────────────── Параметры установки ────────────────${NC}"
-    log_info "NetBird Setup Key:      [СКРЫТ]"
-    log_info "Название инстанса:      $INSTANCE_NAME"
-    log_info "Victoria Metrics URL:   $VICTORIA_METRICS_URL"
+    log_info "Роль ноды:              $NODE_ROLE"
+    if (( ROLE_ONLY == 0 )); then
+        log_info "NetBird Setup Key:      [СКРЫТ]"
+        log_info "Название инстанса:      $INSTANCE_NAME"
+        log_info "Victoria Metrics URL:   $VICTORIA_METRICS_URL"
+    fi
     log_info "NODE_PORT:              $NODE_PORT"
-    log_info "XRAY_PORT:              $XRAY_PORT"
+    log_info "remnawave/node:         $REMNANODE_VERSION"
+    if role_has_site; then
+        log_info "Домен ноды:             $NODE_DOMAIN"
+        log_info "Сайт-заглушка:          127.0.0.1:$SITE_LOCAL_PORT"
+        [[ "$NODE_ROLE" == "entry" ]] && log_info "Reality (Xray):         127.0.0.1:$XRAY_LOCAL_PORT"
+        log_info "Сертификат:             $CERT_SOURCE"
+        if [[ "$CERT_SOURCE" == "certwarden" ]]; then
+            log_info "CertWarden-сервер:      $CW_CLIENT_SERVER_ADDRESS"
+            log_info "Сертификат / ключ:      $CW_CLIENT_CERT_NAME / $CW_CLIENT_KEY_NAME (API-ключи скрыты)"
+            log_info "Окно обновления файлов: $CW_CLIENT_FILE_UPDATE_TIME_START–$CW_CLIENT_FILE_UPDATE_TIME_END ($TZ), $CW_CLIENT_FILE_UPDATE_DAYS_OF_WEEK"
+        fi
+    fi
     log_info "NetBird IP панели:      $PANEL_NETBIRD_IP"
     log_info "SSH-порты:              ${SSH_PORTS:-определяются автоматически}"
     if [[ -n "$SECRET_KEY" ]]; then
@@ -1638,13 +1997,58 @@ confirm_ssh_ports() {
 }
 
 # ─────────────────────────────────────────────────
+# Публичные порты роли — открыты в UFW для всех
+# ─────────────────────────────────────────────────
+UFW_ROLE_COMMENT="Remnawave role"
+
+role_public_ports() {
+    case "$NODE_ROLE" in
+        entry)       echo "443/tcp 80/tcp" ;;
+        exit)        echo "" ;;
+        exit-direct) echo "443/tcp 443/udp 8443/tcp 80/tcp" ;;
+    esac
+}
+
+# ─────────────────────────────────────────────────
+# Удаление правил UFW, которыми управляет скрипт, но которых
+# нет в наборе текущей роли
+#
+# Управляемыми считаются правила с комментарием UFW_ROLE_COMMENT
+# и правила XRAY_PORT из v3 ("Xray TCP" / "Xray UDP"). Остальные
+# правила — SSH, NODE_PORT, добавленные вручную — не трогаются.
+# ─────────────────────────────────────────────────
+prune_role_rules() {
+    local wanted line num to guard=0
+    wanted=" $(role_public_ports) "
+
+    # После каждого удаления нумерация сдвигается, поэтому
+    # перечитываем список заново
+    while (( guard < 50 )); do
+        guard=$(( guard + 1 ))
+        num=""
+        while IFS= read -r line; do
+            [[ "$line" =~ \#\ (Xray\ TCP|Xray\ UDP|${UFW_ROLE_COMMENT})$ ]] || continue
+            [[ "$line" =~ ^\[\ *([0-9]+)\]\ +([0-9]+/(tcp|udp)) ]] || continue
+            to="${BASH_REMATCH[2]}"
+            if [[ "$wanted" != *" $to "* ]]; then
+                num="${BASH_REMATCH[1]}"
+                break
+            fi
+        done < <(ufw status numbered 2>/dev/null)
+
+        [[ -z "$num" ]] && break
+        ufw --force delete "$num" >> "$LOG_FILE" 2>&1
+        log_info "✓ Удалено правило UFW вне роли $NODE_ROLE: $to"
+    done
+}
+
+# ─────────────────────────────────────────────────
 # Настройка UFW Firewall
 #
-# Открываем XRAY_PORT для TCP и UDP — Reality может
-# работать через обоих. NODE_PORT открываем только для
-# NetBird-адреса панели: панель обращается к ноде через
-# mesh-сеть, поэтому источником пакетов будет её адрес
-# в NetBird, а не публичный IP.
+# Публичные порты задаёт роль (role_public_ports). NODE_PORT
+# открываем только для NetBird-адреса панели: панель обращается
+# к ноде через mesh-сеть, поэтому источником пакетов будет её
+# адрес в NetBird, а не публичный IP.
 # ─────────────────────────────────────────────────
 configure_firewall() {
     log "Настройка UFW Firewall..."
@@ -1671,11 +2075,19 @@ configure_firewall() {
         comment "Remnawave panel (NetBird) -> node" >> "$LOG_FILE" 2>&1
     log_info "✓ NODE_PORT $NODE_PORT: разрешён только для $PANEL_NETBIRD_IP (NetBird)"
 
-    # XRAY_PORT — для всех входящих (клиентские подключения)
-    # Открываем и TCP, и UDP: Reality+TCP и возможные QUIC-транспорты
-    ufw allow "$XRAY_PORT"/tcp comment "Xray TCP" >> "$LOG_FILE" 2>&1
-    ufw allow "$XRAY_PORT"/udp comment "Xray UDP" >> "$LOG_FILE" 2>&1
-    log_info "✓ XRAY_PORT $XRAY_PORT: разрешён TCP + UDP"
+    # Публичные порты роли. Правила прошлых запусков, которых нет в
+    # наборе текущей роли, удаляются — так --role-only приводит ноду
+    # к стандарту. BRIDGE_PORT не открывается никогда: мост идёт
+    # через NetBird, а его правила стоят раньше UFW
+    local rule
+    prune_role_rules
+    for rule in $(role_public_ports); do
+        ufw allow "$rule" comment "$UFW_ROLE_COMMENT" >> "$LOG_FILE" 2>&1
+        log_info "✓ $rule: разрешён для всех (роль $NODE_ROLE)"
+    done
+    if [[ -z "$(role_public_ports)" ]]; then
+        log_info "Роль $NODE_ROLE: публичных портов нет, трафик приходит по NetBird"
+    fi
 
     # Включаем UFW (echo y — автоматически соглашаемся на предупреждение)
     echo "y" | ufw enable >> "$LOG_FILE" 2>&1
@@ -1708,6 +2120,8 @@ get_netbird_ip() {
         set -e
     fi
 
+    NETBIRD_FQDN=$(netbird status 2>/dev/null | grep -oP '^FQDN:\s+\K\S+' || true)
+
     if [[ -n "$NETBIRD_IP" ]]; then
         log "✓ NetBird IP: ${GREEN}$NETBIRD_IP${NC}"
     else
@@ -1716,16 +2130,530 @@ get_netbird_ip() {
     fi
 }
 
+# ═════════════════════════════════════════════════
+# Ролевая часть: предпроверки, сертификаты, nginx,
+# CertWarden-клиент, remnanode
+# ═════════════════════════════════════════════════
+
+# ─────────────────────────────────────────────────
+# Для --role-only: базовая часть уже должна стоять
+# ─────────────────────────────────────────────────
+check_role_only_prereqs() {
+    local missing=()
+    command -v docker &> /dev/null || missing+=("docker")
+    command -v netbird &> /dev/null || missing+=("netbird")
+    command -v ufw &> /dev/null || missing+=("ufw")
+
+    if (( ${#missing[@]} > 0 )); then
+        log_error "Режим --role-only: не найдено: ${missing[*]}"
+        log_error "Это не настроенный сервер — запустите полную установку без --role-only"
+        exit 1
+    fi
+    if ! docker compose version &> /dev/null; then
+        log_error "Не найден плагин docker compose (docker compose version)"
+        exit 1
+    fi
+}
+
+# ─────────────────────────────────────────────────
+# PID процессов, слушающих TCP-порт на хосте
+# ─────────────────────────────────────────────────
+port_listener_pids() {
+    ss -Htlnp "sport = :$1" 2>/dev/null | grep -oP 'pid=\K[0-9]+' | sort -u || true
+}
+
+# PID всех процессов контейнера (пусто — контейнера нет или он остановлен)
+container_pids() {
+    command -v docker &> /dev/null || return 0
+    docker top "$1" -eo pid 2>/dev/null | tail -n +2 | tr -d ' ' || true
+}
+
+container_exists() {
+    command -v docker &> /dev/null || return 1
+    docker inspect "$1" &> /dev/null
+}
+
+container_running() {
+    [[ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" == "true" ]]
+}
+
+# ─────────────────────────────────────────────────
+# Свободен ли TCP-порт
+#
+# Порт считается свободным, если его никто не слушает или слушают
+# только процессы перечисленных контейнеров — это повторный запуск
+# скрипта на уже настроенной ноде. Чужой процесс скрипт не
+# останавливает, а показывает, кто держит порт.
+#
+# Аргументы: порт, затем имена «своих» контейнеров.
+# Возвращает 1, если порт занят чужим процессом.
+# ─────────────────────────────────────────────────
+check_port_free() {
+    local port="$1"
+    shift
+
+    local -A own=()
+    local c pid
+    for c in "$@"; do
+        while read -r pid; do
+            [[ -n "$pid" ]] && own["$pid"]=1
+        done < <(container_pids "$c")
+    done
+
+    local foreign=0
+    while read -r pid; do
+        [[ -z "$pid" ]] && continue
+        [[ -n "${own[$pid]:-}" ]] || foreign=1
+    done < <(port_listener_pids "$port")
+
+    if (( foreign == 1 )); then
+        log_error "Порт $port/tcp занят:"
+        ss -tlnp "sport = :$port" 2>/dev/null | tee -a "$LOG_FILE"
+        return 1
+    fi
+    return 0
+}
+
+# ─────────────────────────────────────────────────
+# Контейнер с нашим именем создан из другого места
+#
+# docker compose не может управлять контейнером, созданным другим
+# compose-проектом или вручную: up -d упадёт на конфликте имён.
+# Аргументы: имя контейнера, ожидаемая директория compose-проекта.
+# ─────────────────────────────────────────────────
+check_container_owner() {
+    local name="$1" dir="$2" workdir
+
+    container_exists "$name" || return 0
+    workdir=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$name" 2>/dev/null || true)
+
+    if [[ "$workdir" != "$dir" ]]; then
+        log_error "Контейнер '$name' уже существует, но создан не из $dir (${workdir:-не через docker compose})"
+        log_error "Остановите и удалите его вручную: docker rm -f $name"
+        return 1
+    fi
+    return 0
+}
+
+# ─────────────────────────────────────────────────
+# Предпроверки роли — до любых изменений на сервере
+#
+# Выполняются сразу после разбора параметров, чтобы занятый порт
+# или чужой контейнер обнаружились до долгой базовой установки.
+# ─────────────────────────────────────────────────
+preflight_role() {
+    log "Предпроверки роли $NODE_ROLE..."
+    local failed=0
+
+    command -v ss &> /dev/null || { log_error "Нет утилиты ss (пакет iproute2)"; exit 1; }
+
+    check_container_owner remnanode "$PROJECT_DIR" || failed=1
+    if role_has_site; then
+        check_container_owner nginx "$NGINX_DIR" || failed=1
+        if [[ "$CERT_SOURCE" == "certwarden" ]]; then
+            check_container_owner certwarden-client "$CERTWARDEN_DIR" || failed=1
+
+            # Порт публикует docker-proxy, а не процесс контейнера,
+            # поэтому «свой» слушатель определяем по контейнеру
+            if [[ -n "$(port_listener_pids 5055)" ]] && ! container_running certwarden-client; then
+                log_error "Порт 5055/tcp (CertWarden-клиент) занят:"
+                ss -tlnp "sport = :5055" 2>/dev/null | tee -a "$LOG_FILE"
+                failed=1
+            fi
+        fi
+    fi
+
+    # 443 на entry принимает nginx, на exit-direct — Xray внутри remnanode.
+    # Локальные порты тоже проверяем: если сайт-заглушку не удастся
+    # поднять на SITE_LOCAL_PORT, Reality потеряет target
+    case "$NODE_ROLE" in
+        entry)
+            check_port_free 443 nginx || failed=1
+            check_port_free 80 nginx || failed=1
+            check_port_free "$SITE_LOCAL_PORT" nginx || failed=1
+            check_port_free "$XRAY_LOCAL_PORT" remnanode || failed=1
+            ;;
+        exit-direct)
+            check_port_free 443 remnanode || failed=1
+            check_port_free 80 nginx || failed=1
+            check_port_free "$SITE_LOCAL_PORT" nginx || failed=1
+            ;;
+    esac
+
+    # Контейнеры, которые на старых нодах ставились вручную. Они
+    # держат те же порты и перезапускают nginx под другим именем
+    local legacy
+    for legacy in remnawave-nginx certwardenclient; do
+        if container_exists "$legacy"; then
+            log_warning "Найден контейнер прежней ручной установки: $legacy"
+            log_warning "После проверки новой схемы удалите его: docker rm -f $legacy"
+        fi
+    done
+
+    if (( failed == 1 )); then
+        log_error "Предпроверки не пройдены — на сервере ничего не изменено"
+        log_error "Освободите порты или уберите конфликтующие контейнеры и запустите скрипт снова"
+        exit 1
+    fi
+    log_info "✓ Предпроверки пройдены"
+}
+
+# ─────────────────────────────────────────────────
+# Установка конфига с резервной копией
+#
+# Если файл не изменился — ничего не делает и возвращает 1.
+# Иначе сохраняет старую версию в <компонент>/backup-<дата>/
+# и записывает новую. Запись идёт в существующий файл (cat >),
+# а не через mv: файл может быть смонтирован в контейнер по
+# отдельности, и после mv контейнер продолжал бы видеть старый.
+#
+# Аргументы: временный файл, целевой путь, директория компонента.
+# ─────────────────────────────────────────────────
+install_config() {
+    local src="$1" dest="$2" comp_dir="$3"
+
+    if [[ -f "$dest" ]] && cmp -s "$src" "$dest"; then
+        rm -f "$src"
+        log_info "Без изменений: $dest"
+        return 1
+    fi
+
+    if [[ -f "$dest" ]]; then
+        local backup_dir="$comp_dir/backup-$BACKUP_STAMP"
+        mkdir -p "$backup_dir"
+        cp -p "$dest" "$backup_dir/"
+        log_info "Старая версия сохранена: $backup_dir/$(basename "$dest")"
+    fi
+
+    cat "$src" > "$dest"
+    rm -f "$src"
+    log_info "✓ Записан: $dest"
+    return 0
+}
+
+# ─────────────────────────────────────────────────
+# Значение для YAML в одинарных кавычках
+#
+# Секреты могут содержать любые символы. В одинарных кавычках
+# YAML экранирует только саму кавычку (''), а $ удваивается,
+# чтобы docker compose не принял его за подстановку переменной.
+# ─────────────────────────────────────────────────
+yaml_quote() {
+    local v="$1"
+    v="${v//\'/\'\'}"
+    v="${v//\$/\$\$}"
+    printf "'%s'" "$v"
+}
+
+# ─────────────────────────────────────────────────
+# Получение шаблона из репозитория
+#
+# Если скрипт запущен из клона, шаблон берётся рядом со скриптом.
+# При запуске через curl | bash локальной копии нет — шаблон
+# скачивается с GitHub из ветки INSTALLER_REF.
+# Аргументы: путь внутри templates/, путь назначения.
+# ─────────────────────────────────────────────────
+fetch_template() {
+    local rel="$1" dest="$2"
+    local script_path="${BASH_SOURCE[0]:-}"
+
+    if [[ -f "$script_path" ]]; then
+        local local_tpl
+        local_tpl="$(cd "$(dirname "$script_path")" && pwd)/templates/$rel"
+        if [[ -f "$local_tpl" ]]; then
+            cp "$local_tpl" "$dest"
+            return 0
+        fi
+    fi
+
+    if ! download_file "$TEMPLATES_URL/$rel" "$dest" >> "$LOG_FILE" 2>&1; then
+        log_error "Не удалось получить шаблон $rel ($TEMPLATES_URL/$rel)"
+        exit 1
+    fi
+}
+
+# ─────────────────────────────────────────────────
+# Проверка сертификата в /opt/certs
+#
+# Файлы есть и читаются, сертификат не просрочен, ключ от него,
+# домен ноды входит в SAN. Возвращает 1 при первой же проблеме,
+# сообщение уже выведено.
+# ─────────────────────────────────────────────────
+check_cert_files() {
+    local chain="$CERTS_DIR/$CERT_FULLCHAIN" key="$CERTS_DIR/$CERT_PRIVKEY"
+
+    if [[ ! -s "$chain" || ! -s "$key" ]]; then
+        log_error "Нет файлов сертификата: нужны $chain и $key"
+        return 1
+    fi
+    if ! openssl x509 -in "$chain" -noout &> /dev/null; then
+        log_error "$chain не читается как сертификат PEM"
+        return 1
+    fi
+    if ! openssl pkey -in "$key" -noout &> /dev/null; then
+        log_error "$key не читается как приватный ключ PEM"
+        return 1
+    fi
+    if ! openssl x509 -in "$chain" -noout -checkend 0 &> /dev/null; then
+        log_error "Сертификат $chain просрочен ($(openssl x509 -in "$chain" -noout -enddate))"
+        return 1
+    fi
+
+    local cert_pub key_pub
+    cert_pub=$(openssl x509 -in "$chain" -noout -pubkey 2>/dev/null)
+    key_pub=$(openssl pkey -in "$key" -pubout 2>/dev/null)
+    if [[ "$cert_pub" != "$key_pub" ]]; then
+        log_error "Ключ $key не подходит к сертификату $chain"
+        return 1
+    fi
+
+    if ! openssl x509 -in "$chain" -noout -checkhost "$NODE_DOMAIN" 2>/dev/null | grep -q "does match"; then
+        log_error "Сертификат не покрывает домен $NODE_DOMAIN"
+        log_error "SAN: $(openssl x509 -in "$chain" -noout -ext subjectAltName 2>/dev/null | tail -n +2 | xargs)"
+        return 1
+    fi
+
+    if ! openssl x509 -in "$chain" -noout -checkend $(( 14 * 86400 )) &> /dev/null; then
+        log_warning "Сертификат истекает меньше чем через 14 дней"
+    fi
+    return 0
+}
+
+# ─────────────────────────────────────────────────
+# CertWarden-клиент
+#
+# Повторяет схему с рабочих серверов: клиент пишет файлы в
+# /opt/certwarden/certs внутри контейнера (это /opt/certs на хосте)
+# и после продления перезапускает контейнер nginx через docker.sock.
+#
+# remnanode не перезапускается: Xray сам перечитывает файлы
+# сертификата раз в час, а перезапуск рвёт все подключения.
+# ─────────────────────────────────────────────────
+deploy_certwarden() {
+    log "Настройка CertWarden-клиента..."
+
+    mkdir -p "$CERTWARDEN_DIR"
+    chmod 700 "$CERTWARDEN_DIR"   # в compose-файле секреты
+
+    local tmp="$CERTWARDEN_DIR/.docker-compose.yml.tmp"
+    : > "$tmp"
+    chmod 600 "$tmp"
+
+# Heredoc специально начинается с колонки 0
+cat >> "$tmp" <<EOF
+# Сгенерировано setup_remnawave_node.sh — содержит секреты, chmod 600
+services:
+  certwarden-client:
+    container_name: certwarden-client
+    image: ${CERTWARDEN_IMAGE}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5055:5055"
+    environment:
+      TZ: $(yaml_quote "$TZ")
+      CW_CLIENT_SERVER_ADDRESS: $(yaml_quote "$CW_CLIENT_SERVER_ADDRESS")
+      CW_CLIENT_AES_KEY_BASE64: $(yaml_quote "$CW_CLIENT_AES_KEY_BASE64")
+      CW_CLIENT_KEY_NAME: $(yaml_quote "$CW_CLIENT_KEY_NAME")
+      CW_CLIENT_KEY_APIKEY: $(yaml_quote "$CW_CLIENT_KEY_APIKEY")
+      CW_CLIENT_CERT_NAME: $(yaml_quote "$CW_CLIENT_CERT_NAME")
+      CW_CLIENT_CERT_APIKEY: $(yaml_quote "$CW_CLIENT_CERT_APIKEY")
+      CW_CLIENT_FILE_UPDATE_TIME_START: $(yaml_quote "$CW_CLIENT_FILE_UPDATE_TIME_START")
+      CW_CLIENT_FILE_UPDATE_TIME_END: $(yaml_quote "$CW_CLIENT_FILE_UPDATE_TIME_END")
+      CW_CLIENT_FILE_UPDATE_DAYS_OF_WEEK: $(yaml_quote "$CW_CLIENT_FILE_UPDATE_DAYS_OF_WEEK")
+      CW_CLIENT_CERT_PATH: '/opt/certwarden/certs'
+      CW_CLIENT_CERTCHAIN_PEM_FILENAME: '${CERT_FULLCHAIN}'
+      CW_CLIENT_KEY_PEM_FILENAME: '${CERT_PRIVKEY}'
+      CW_CLIENT_RESTART_DOCKER_CONTAINER0: 'nginx'
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${CERTS_DIR}:/opt/certwarden/certs
+EOF
+
+    local compose="$CERTWARDEN_DIR/docker-compose.yml"
+    install_config "$tmp" "$compose" "$CERTWARDEN_DIR" || true
+    chmod 600 "$compose"
+    find "$CERTWARDEN_DIR" -maxdepth 2 -name 'docker-compose.yml' -path '*/backup-*' -exec chmod 600 {} +
+
+    if ! docker compose -f "$compose" up -d >> "$LOG_FILE" 2>&1; then
+        log_error "Не удалось запустить certwarden-client, подробности: $LOG_FILE"
+        exit 1
+    fi
+    log_info "✓ certwarden-client запущен"
+
+    # При старте клиент сам забирает текущие ключ и сертификат
+    # с сервера. Ждём появления файлов.
+    local waited=0 max_wait=120
+    while [[ ! -s "$CERTS_DIR/$CERT_FULLCHAIN" || ! -s "$CERTS_DIR/$CERT_PRIVKEY" ]]; do
+        if (( waited >= max_wait )); then
+            log_error "За ${max_wait}с CertWarden-клиент не записал $CERT_FULLCHAIN и $CERT_PRIVKEY в $CERTS_DIR"
+            log_error "Логи клиента: docker logs certwarden-client"
+            log_error "Проверьте CW_CLIENT_* в $ENV_FILE и доступность $CW_CLIENT_SERVER_ADDRESS"
+            exit 1
+        fi
+        sleep 3
+        waited=$(( waited + 3 ))
+    done
+    log_info "✓ Файлы сертификата получены от CertWarden"
+}
+
+# ─────────────────────────────────────────────────
+# Сертификат для ролей entry и exit-direct
+# ─────────────────────────────────────────────────
+setup_certificates() {
+    log "Сертификат ($CERT_SOURCE)..."
+
+    mkdir -p "$CERTS_DIR"
+    chmod 755 "$CERTS_DIR"
+
+    if [[ "$CERT_SOURCE" == "certwarden" ]]; then
+        deploy_certwarden
+    fi
+
+    until check_cert_files; do
+        if [[ "$CERT_SOURCE" == "certwarden" ]] || (( NON_INTERACTIVE == 1 )); then
+            echo ""
+            log_error "Положите сертификат (wildcard или на $NODE_DOMAIN) в $CERTS_DIR:"
+            log_error "   $CERTS_DIR/$CERT_FULLCHAIN  — сертификат с цепочкой"
+            log_error "   $CERTS_DIR/$CERT_PRIVKEY    — приватный ключ"
+            log_error "и запустите скрипт снова (можно с --role-only)"
+            exit 1
+        fi
+        echo ""
+        echo -e "${YELLOW}Положите файлы в $CERTS_DIR:${NC}"
+        echo -e "   $CERTS_DIR/$CERT_FULLCHAIN  — сертификат с цепочкой"
+        echo -e "   $CERTS_DIR/$CERT_PRIVKEY    — приватный ключ"
+        read -rp "$(echo -e "Нажмите ${GREEN}Enter${NC}, когда файлы будут на месте (Ctrl+C — отмена): ")" _ < /dev/tty
+    done
+
+    chmod 600 "$CERTS_DIR/$CERT_PRIVKEY"
+    chmod 644 "$CERTS_DIR/$CERT_FULLCHAIN"
+
+    log "✓ Сертификат в порядке"
+    log_info "Действует до: $(openssl x509 -in "$CERTS_DIR/$CERT_FULLCHAIN" -noout -enddate | cut -d= -f2)"
+    log_info "SAN: $(openssl x509 -in "$CERTS_DIR/$CERT_FULLCHAIN" -noout -ext subjectAltName 2>/dev/null | tail -n +2 | xargs)"
+}
+
+# ─────────────────────────────────────────────────
+# nginx: SNI-роутер и/или сайт-заглушка
+# ─────────────────────────────────────────────────
+setup_nginx() {
+    log "Настройка nginx ($NODE_ROLE)..."
+
+    mkdir -p "$NGINX_DIR/html"
+
+    # Сайт-заглушка — только в пустую папку: свой сайт владельца не трогаем
+    if [[ -z "$(ls -A "$NGINX_DIR/html" 2>/dev/null)" ]]; then
+        fetch_template site/index.html "$NGINX_DIR/html/index.html"
+        chmod 644 "$NGINX_DIR/html/index.html"
+        log_info "✓ Сайт-заглушка положен в $NGINX_DIR/html/"
+    else
+        log_info "В $NGINX_DIR/html/ уже есть файлы — сайт не трогаем"
+    fi
+
+    # Шаблон → конфиг. Значения проверены в resolve_params (домен —
+    # только [a-z0-9.-], порты — числа), поэтому sed безопасен
+    local tmp_conf="$NGINX_DIR/.nginx.conf.tmp"
+    fetch_template "nginx/${NODE_ROLE}.conf.tpl" "$tmp_conf"
+    sed -i \
+        -e "s/{{NODE_DOMAIN}}/${NODE_DOMAIN}/g" \
+        -e "s/{{XRAY_LOCAL_PORT}}/${XRAY_LOCAL_PORT}/g" \
+        -e "s/{{SITE_LOCAL_PORT}}/${SITE_LOCAL_PORT}/g" \
+        "$tmp_conf"
+    if grep -q '{{' "$tmp_conf"; then
+        log_error "В шаблоне nginx остались неподставленные значения: $(grep -o '{{[A-Z_]*}}' "$tmp_conf" | sort -u | xargs)"
+        exit 1
+    fi
+
+    # Проверяем конфиг до установки, в одноразовом контейнере без сети
+    if ! docker run --rm --network none \
+            -v "$tmp_conf:/etc/nginx/nginx.conf:ro" \
+            -v "$CERTS_DIR:/etc/nginx/ssl:ro" \
+            "$NGINX_IMAGE" nginx -t >> "$LOG_FILE" 2>&1; then
+        log_error "nginx -t не принял новый конфиг (он сохранён в $tmp_conf), подробности: $LOG_FILE"
+        exit 1
+    fi
+    log_info "✓ nginx -t: конфиг корректен"
+
+    NGINX_CONF_CHANGED=0
+    if install_config "$tmp_conf" "$NGINX_DIR/nginx.conf" "$NGINX_DIR"; then
+        NGINX_CONF_CHANGED=1
+    fi
+
+    local tmp_compose="$NGINX_DIR/.docker-compose.yml.tmp"
+cat > "$tmp_compose" <<EOF
+# Сгенерировано setup_remnawave_node.sh
+services:
+  nginx:
+    container_name: nginx
+    image: ${NGINX_IMAGE}
+    network_mode: host
+    restart: always
+    volumes:
+      - ${NGINX_DIR}/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ${NGINX_DIR}/html:/usr/share/nginx/html:ro
+      # Папкой, а не отдельными файлами: CertWarden заменяет файлы,
+      # и смонтированный по отдельности файл показывал бы старую версию
+      - ${CERTS_DIR}:/etc/nginx/ssl:ro
+EOF
+    install_config "$tmp_compose" "$NGINX_DIR/docker-compose.yml" "$NGINX_DIR" || true
+
+    local was_running=0
+    container_running nginx && was_running=1
+
+    if ! docker compose -f "$NGINX_DIR/docker-compose.yml" up -d >> "$LOG_FILE" 2>&1; then
+        log_error "Не удалось запустить nginx, подробности: $LOG_FILE и docker logs nginx"
+        exit 1
+    fi
+
+    # Контейнер уже работал, а поменялся только nginx.conf — compose
+    # его не пересоздаст. reload, в отличие от restart, не рвёт
+    # текущие подключения через stream
+    if (( was_running == 1 && NGINX_CONF_CHANGED == 1 )); then
+        if docker exec nginx nginx -s reload >> "$LOG_FILE" 2>&1; then
+            log_info "✓ nginx перечитал конфиг (reload)"
+        else
+            log_warning "nginx -s reload не удался — проверьте docker logs nginx"
+        fi
+    fi
+    log "✓ nginx запущен"
+}
+
+# ─────────────────────────────────────────────────
+# SECRET_KEY из существующего docker-compose.yml
+#
+# Повторный запуск и --role-only на рабочей ноде не должны
+# затирать действующий ключ плейсхолдером.
+# ─────────────────────────────────────────────────
+existing_secret_key() {
+    local compose="$PROJECT_DIR/docker-compose.yml" key
+    [[ -f "$compose" ]] || return 0
+
+    # Поддерживаем обе записи: "- SECRET_KEY=..." и "SECRET_KEY: ..."
+    key=$(grep -oP '^\s*-?\s*SECRET_KEY\s*[=:]\s*\K.*' "$compose" | head -n1 || true)
+    key="${key%$'\r'}"
+    key="${key#[\"\']}"
+    key="${key%[\"\']}"
+    [[ "$key" == "REPLACE_WITH_SECRET_KEY_FROM_PANEL" ]] && key=""
+    printf '%s' "$key"
+}
+
 # ─────────────────────────────────────────────────
 # Генерация docker-compose.yml для Remnawave Node
 #
 # Создаётся шаблон на основе официального docker-compose remnanode.
 # SECRET_KEY запрашивается у пользователя — его выдаёт панель Remnawave
 # при создании ноды. Использует network_mode: host, поэтому явные port
-# mappings не нужны — порты настраиваются внутри контейнера через env.
+# mappings не нужны — порты Xray задаёт профиль в панели.
 # ─────────────────────────────────────────────────
 generate_docker_compose() {
     log "Генерация docker-compose.yml для Remnawave Node..."
+
+    mkdir -p "$PROJECT_DIR"
+
+    if [[ -z "$SECRET_KEY" ]]; then
+        SECRET_KEY=$(existing_secret_key)
+        [[ -n "$SECRET_KEY" ]] && log_info "SECRET_KEY взят из существующего $PROJECT_DIR/docker-compose.yml"
+    fi
 
     # SECRET_KEY может прийти из конфигурации или окружения.
     # Если его нет — спрашиваем, а в неинтерактивном режиме
@@ -1748,16 +2676,28 @@ generate_docker_compose() {
         log_warning "SECRET_KEY не задан. Не забудьте заполнить его в $PROJECT_DIR/docker-compose.yml"
     fi
 
+    # exit-direct: сертификат для Hysteria2 и прямых TLS-подключений.
+    # Монтируется папка целиком — см. комментарий в compose nginx
+    local ssl_volume=""
+    if [[ "$NODE_ROLE" == "exit-direct" ]]; then
+        ssl_volume="      - ${CERTS_DIR}:${REMNANODE_SSL_DIR}:ro"
+    fi
+
+    local tmp="$PROJECT_DIR/.docker-compose.yml.tmp"
+    : > "$tmp"
+    chmod 600 "$tmp"
+
 # Heredoc специально начинается с колонки 0.
 # network_mode: host — контейнер напрямую использует сетевой стек хоста,
 # поэтому порты открываются через UFW (уже настроен выше), а не через
 # Docker port mapping.
-cat > "$PROJECT_DIR/docker-compose.yml" <<EOF
+cat >> "$tmp" <<EOF
+# Сгенерировано setup_remnawave_node.sh, роль: ${NODE_ROLE}
 services:
   remnanode:
     container_name: remnanode
     hostname: remnanode
-    image: remnawave/node:latest
+    image: remnawave/node:${REMNANODE_VERSION}
     network_mode: host
     restart: always
     cap_add:
@@ -1768,17 +2708,181 @@ services:
         hard: 1048576
     environment:
       - NODE_PORT=${NODE_PORT}
-      - XRAY_PORT=${XRAY_PORT}
       - SECRET_KEY=${secret_key}
     volumes:
       - /var/log/remnanode:/var/log/remnanode
+${ssl_volume}
 EOF
+    # Пустая строка на месте ssl_volume для других ролей не нужна
+    [[ -z "$ssl_volume" ]] && sed -i '$ { /^$/d }' "$tmp"
 
-    log "✓ docker-compose.yml создан: $PROJECT_DIR/docker-compose.yml"
+    local compose="$PROJECT_DIR/docker-compose.yml"
+    install_config "$tmp" "$compose" "$PROJECT_DIR" || true
+    chmod 600 "$compose"   # в файле SECRET_KEY
 
     if [[ "$secret_key" == "REPLACE_WITH_SECRET_KEY_FROM_PANEL" ]]; then
-        log_warning "Перед запуском замените SECRET_KEY в docker-compose.yml"
+        log_warning "Перед запуском замените SECRET_KEY в $compose и выполните:"
+        log_warning "   cd $PROJECT_DIR && docker compose up -d"
+        return 0
     fi
+
+    # up -d пересоздаёт контейнер, только если compose изменился
+    if docker compose -f "$compose" up -d >> "$LOG_FILE" 2>&1; then
+        log "✓ remnanode запущен (remnawave/node:${REMNANODE_VERSION})"
+    else
+        log_error "Не удалось запустить remnanode, подробности: $LOG_FILE и docker logs remnanode"
+        exit 1
+    fi
+}
+
+# ─────────────────────────────────────────────────
+# Итоговая проверка роли
+#
+# Не останавливает скрипт: всё уже установлено, задача — показать,
+# что работает, а что нет. Итог — число непройденных пунктов.
+# ─────────────────────────────────────────────────
+VERIFY_FAILED=0
+
+report_check() {
+    local ok="$1" text="$2"
+    if [[ "$ok" == "ok" ]]; then
+        echo -e "   ${GREEN}✓${NC} $text" | tee -a "$LOG_FILE"
+    else
+        echo -e "   ${RED}✗${NC} $text" | tee -a "$LOG_FILE"
+        VERIFY_FAILED=$(( VERIFY_FAILED + 1 ))
+    fi
+}
+
+# TLS-рукопожатие с сайтом-заглушкой. Проверяет то, что нужно
+# Reality от target: TLS 1.3, ALPN h2 и валидный для домена сертификат.
+# Аргументы: адрес:порт, SNI. Код возврата 0 — всё в порядке.
+check_site_tls() {
+    local target="$1" sni="$2" out
+    out=$(echo | timeout 10 openssl s_client -connect "$target" -servername "$sni" \
+            -tls1_3 -alpn h2 -verify_hostname "$NODE_DOMAIN" 2>&1 || true)
+    grep -q 'Verify return code: 0 (ok)' <<< "$out" \
+        && grep -q 'ALPN protocol: h2' <<< "$out"
+}
+
+verify_role() {
+    VERIFY_FAILED=0
+    echo ""
+    echo -e "${CYAN}──────────────── Итоговая проверка (роль ${NODE_ROLE}) ────────────────${NC}"
+
+    # Контейнеры роли
+    local containers=(remnanode) c
+    role_has_site && containers+=(nginx)
+    role_has_site && [[ "$CERT_SOURCE" == "certwarden" ]] && containers+=(certwarden-client)
+    for c in "${containers[@]}"; do
+        if container_running "$c"; then
+            report_check ok "контейнер $c запущен"
+        elif [[ "$c" == "remnanode" && -z "$SECRET_KEY" ]]; then
+            report_check fail "контейнер remnanode не запущен: нет SECRET_KEY (впишите в $PROJECT_DIR/docker-compose.yml)"
+        else
+            report_check fail "контейнер $c не запущен (docker logs $c)"
+        fi
+    done
+
+    # Слушатели и сайт
+    local ss_out
+    case "$NODE_ROLE" in
+        entry)
+            ss_out=$(ss -Htlnp 'sport = :443' 2>/dev/null || true)
+            if grep -qE '(0\.0\.0\.0|\*):443 ' <<< "$ss_out" && grep -q nginx <<< "$ss_out"; then
+                report_check ok "nginx слушает 0.0.0.0:443"
+            else
+                report_check fail "nginx не слушает 0.0.0.0:443"
+            fi
+            ss_out=$(ss -Htlnp 'sport = :80' 2>/dev/null || true)
+            if grep -qE '(0\.0\.0\.0|\*):80 ' <<< "$ss_out" && grep -q nginx <<< "$ss_out"; then
+                report_check ok "nginx слушает 0.0.0.0:80"
+            else
+                report_check fail "nginx не слушает 0.0.0.0:80"
+            fi
+            if check_site_tls "127.0.0.1:$SITE_LOCAL_PORT" "$NODE_DOMAIN"; then
+                report_check ok "сайт на 127.0.0.1:$SITE_LOCAL_PORT: TLS 1.3, h2, сертификат валиден для $NODE_DOMAIN"
+            else
+                report_check fail "сайт на 127.0.0.1:$SITE_LOCAL_PORT не прошёл проверку TLS 1.3 + h2 + сертификат"
+            fi
+            # Чужой SNI на 443 должен уходить на сайт, а не в Xray
+            if check_site_tls "127.0.0.1:443" "example.com"; then
+                report_check ok "443 с чужим SNI отдаёт сайт-заглушку"
+            else
+                report_check fail "443 с чужим SNI не отдаёт сайт-заглушку"
+            fi
+            ;;
+        exit-direct)
+            if check_site_tls "127.0.0.1:$SITE_LOCAL_PORT" "$NODE_DOMAIN"; then
+                report_check ok "сайт на 127.0.0.1:$SITE_LOCAL_PORT: TLS 1.3, h2, сертификат валиден для $NODE_DOMAIN"
+            else
+                report_check fail "сайт на 127.0.0.1:$SITE_LOCAL_PORT не прошёл проверку TLS 1.3 + h2 + сертификат"
+            fi
+            if container_running remnanode \
+                && docker exec remnanode test -r "$REMNANODE_SSL_DIR/$CERT_FULLCHAIN" 2>/dev/null \
+                && docker exec remnanode test -r "$REMNANODE_SSL_DIR/$CERT_PRIVKEY" 2>/dev/null; then
+                report_check ok "сертификат виден в remnanode: $REMNANODE_SSL_DIR/"
+            else
+                report_check fail "сертификат не виден в remnanode по пути $REMNANODE_SSL_DIR/"
+            fi
+            ;;
+    esac
+
+    # Порт моста не должен быть разрешён в UFW
+    if ufw status 2>/dev/null | grep -qE "^${BRIDGE_PORT}(/(tcp|udp))?[[:space:]]"; then
+        report_check fail "${BRIDGE_PORT} разрешён в UFW — мост должен идти только через NetBird (ufw status numbered)"
+    else
+        report_check ok "${BRIDGE_PORT} в UFW не разрешён"
+    fi
+
+    # NetBird
+    if netbird status 2>/dev/null | grep -q 'Management: Connected'; then
+        report_check ok "NetBird подключён: IP ${NETBIRD_IP:-?}, FQDN ${NETBIRD_FQDN:-?}"
+    else
+        report_check fail "NetBird не подключён (netbird status)"
+    fi
+
+    echo ""
+    if (( VERIFY_FAILED == 0 )); then
+        log "✓ Все проверки пройдены"
+    else
+        log_warning "Не пройдено проверок: $VERIFY_FAILED — см. пункты с ✗"
+    fi
+}
+
+# ─────────────────────────────────────────────────
+# Что сделать в панели для этой роли
+# ─────────────────────────────────────────────────
+show_panel_hints() {
+    echo -e "${BLUE}📝 Что сделать в панели (роль ${NODE_ROLE}):${NC}"
+    echo ""
+    echo -e "  ${YELLOW}1.${NC} Nodes → Management → [+]"
+    echo -e "     Node Address: ${GREEN}${NETBIRD_IP:-<netbird_ip>}${NC}  (NetBird IP, не публичный)"
+    echo -e "     Node Port:    ${GREEN}$NODE_PORT${NC}"
+    if [[ -z "$SECRET_KEY" ]]; then
+        echo -e "     Скопируйте SECRET_KEY в ${GREEN}$PROJECT_DIR/docker-compose.yml${NC}, затем:"
+        echo -e "     ${GREEN}cd $PROJECT_DIR && docker compose up -d${NC}"
+    fi
+    echo ""
+
+    case "$NODE_ROLE" in
+        entry)
+            echo -e "  ${YELLOW}2.${NC} Config Profile: ${GREEN}entry-ru${NC}"
+            echo -e "  ${YELLOW}3.${NC} В инбаунде ${GREEN}entry-selfsteal${NC} добавьте ${GREEN}$NODE_DOMAIN${NC} в serverNames"
+            echo -e "  ${YELLOW}4.${NC} Создайте хост: адрес ${GREEN}$NODE_DOMAIN${NC}, SNI ${GREEN}$NODE_DOMAIN${NC} — указать явно"
+            ;;
+        exit)
+            echo -e "  ${YELLOW}2.${NC} Config Profile: ${GREEN}exit${NC}"
+            echo -e "  ${YELLOW}3.${NC} В NetBird переименуйте пир ${GREEN}${NETBIRD_FQDN:-этого сервера}${NC} в ${GREEN}exit-<страна><номер>${NC}"
+            echo -e "  ${YELLOW}4.${NC} В профиль ${GREEN}entry-ru${NC} добавьте аутбаунд ${GREEN}to-...${NC} на эту ноду"
+            echo -e "  ${YELLOW}5.${NC} Создайте служебного пользователя ${GREEN}_bridge-...${NC} в скваде ${GREEN}bridges${NC}"
+            ;;
+        exit-direct)
+            echo -e "  ${YELLOW}2.${NC} Config Profile: ${GREEN}exit-direct${NC}"
+            echo -e "  ${YELLOW}3.${NC} Создайте хосты для прямых подключений (адрес ${GREEN}$NODE_DOMAIN${NC})"
+            echo -e "     Сертификат в профиле: ${GREEN}$REMNANODE_SSL_DIR/$CERT_FULLCHAIN${NC} и ${GREEN}$CERT_PRIVKEY${NC}"
+            ;;
+    esac
+    echo ""
 }
 
 # ─────────────────────────────────────────────────
@@ -1799,38 +2903,34 @@ show_next_steps() {
     fi
     echo ""
 
-    echo -e "${BLUE}📊 Мониторинг (linux-${ARCH_SUFFIX}):${NC}"
-    echo -e "   ✓ cAdvisor v${CADVISOR_VERSION}       → 127.0.0.1:9101"
-    echo -e "   ✓ Node Exporter v${NODE_EXPORTER_VERSION}  → 127.0.0.1:9100"
-    echo -e "   ✓ vmagent v${VMAGENT_VERSION}       → 127.0.0.1:8429"
-    echo -e "   Instance label: ${GREEN}$INSTANCE_NAME${NC}"
-    echo -e "   Remote write:   ${GREEN}$VICTORIA_METRICS_URL${NC}"
-    echo ""
+    if (( ROLE_ONLY == 0 )); then
+        echo -e "${BLUE}📊 Мониторинг (linux-${ARCH_SUFFIX}):${NC}"
+        echo -e "   ✓ cAdvisor v${CADVISOR_VERSION}       → 127.0.0.1:9101"
+        echo -e "   ✓ Node Exporter v${NODE_EXPORTER_VERSION}  → 127.0.0.1:9100"
+        echo -e "   ✓ vmagent v${VMAGENT_VERSION}       → 127.0.0.1:8429"
+        echo -e "   Instance label: ${GREEN}$INSTANCE_NAME${NC}"
+        echo -e "   Remote write:   ${GREEN}$VICTORIA_METRICS_URL${NC}"
+        echo ""
+    fi
 
-    echo -e "${BLUE}🔒 Firewall (UFW):${NC}"
+    echo -e "${BLUE}🔒 Firewall (UFW), роль ${NODE_ROLE}:${NC}"
     echo -e "   ✓ SSH ${SSH_PORT_LIST[*]}          — разрешён (TCP)"
     echo -e "   ✓ NODE_PORT $NODE_PORT  — только для $PANEL_NETBIRD_IP (NetBird, TCP)"
-    echo -e "   ✓ XRAY_PORT $XRAY_PORT — все (TCP + UDP)"
+    if [[ -n "$(role_public_ports)" ]]; then
+        echo -e "   ✓ Для всех: $(role_public_ports)"
+    else
+        echo -e "   ✓ Публичных портов нет"
+    fi
+    echo -e "   ✓ ${BRIDGE_PORT}/tcp (мост) — не открыт, работает через NetBird"
     echo ""
 
-    echo -e "${BLUE}📝 Следующие шаги:${NC}"
-    echo ""
-    echo -e "  ${YELLOW}1.${NC} Войдите в панель Remnawave: Nodes → Management → [+]"
-    echo -e "     Node Address: ${GREEN}${NETBIRD_IP:-<netbird_ip>}${NC}"
-    echo -e "     Node Port:    ${GREEN}$NODE_PORT${NC}"
-    echo ""
-    echo -e "  ${YELLOW}2.${NC} Скопируйте SECRET_KEY из панели и добавьте в:"
-    echo -e "     ${GREEN}nano $PROJECT_DIR/docker-compose.yml${NC}"
-    echo ""
-    echo -e "  ${YELLOW}3.${NC} Запустите контейнер ноды:"
-    echo -e "     ${GREEN}cd $PROJECT_DIR && docker compose up -d${NC}"
-    echo -e "     ${GREEN}docker compose logs -f -t${NC}"
-    echo ""
-    echo -e "  ${YELLOW}4.${NC} В панели нажмите Next → выберите Config Profile → Create"
-    echo ""
+    show_panel_hints
+
     echo -e "${BLUE}🔍 Полезные команды:${NC}"
-    echo -e "   systemctl status cadvisor nodeexporter vmagent"
-    echo -e "   journalctl -u vmagent -f"
+    (( ROLE_ONLY == 0 )) && echo -e "   systemctl status cadvisor nodeexporter vmagent"
+    echo -e "   docker logs -f remnanode"
+    role_has_site && echo -e "   docker logs -f nginx"
+    [[ "$CERT_SOURCE" == "certwarden" ]] && role_has_site && echo -e "   docker logs -f certwarden-client"
     echo -e "   ufw status numbered"
     echo -e "   netbird status"
     echo ""
@@ -1852,7 +2952,7 @@ main() {
     parse_args "$@"
 
     echo -e "${GREEN}═══════════════════════════════════════════════════════════${NC}"
-    echo -e "${GREEN}   Remnawave Node Auto-Installer v3.2.1                    ${NC}"
+    echo -e "${GREEN}   Remnawave Node Auto-Installer v4.0.0                    ${NC}"
     echo -e "${GREEN}═══════════════════════════════════════════════════════════${NC}"
     echo ""
 
@@ -1865,6 +2965,11 @@ main() {
     detect_arch
     resolve_params
 
+    (( ROLE_ONLY == 1 )) && check_role_only_prereqs
+
+    # Занятые порты и чужие контейнеры — до любых изменений
+    preflight_role
+
     # Параметры собраны и проверены — сохраняем их для повторного
     # запуска. В неинтерактивном режиме файлом управляет пользователь,
     # поэтому не трогаем его.
@@ -1872,27 +2977,39 @@ main() {
         save_env_file
     fi
 
-    log "Начало установки..."
+    log "Начало установки (роль $NODE_ROLE$( (( ROLE_ONLY == 1 )) && echo ', только ролевая часть'))..."
 
-    # Базовые компоненты
-    update_system
-    # После apt update, но до первой загрузки: списки пакетов уже
-    # актуальны, а недостающий загрузчик обнаружится сразу, а не
-    # на середине установки
-    ensure_dependencies
-    install_netbird
-    setup_netbird
-    install_docker
-    create_project_dir
+    if (( ROLE_ONLY == 0 )); then
+        # Базовые компоненты
+        update_system
+        # После apt update, но до первой загрузки: списки пакетов уже
+        # актуальны, а недостающий загрузчик обнаружится сразу, а не
+        # на середине установки
+        ensure_dependencies
+        install_netbird
+        setup_netbird
+        install_docker
+        create_project_dir
 
-    # Мониторинг
-    create_monitoring_dirs
-    install_all_monitoring_binaries  # ← параллельная загрузка всех трёх
-    create_monitoring_configs
-    start_monitoring_services
+        # Мониторинг
+        create_monitoring_dirs
+        install_all_monitoring_binaries  # ← параллельная загрузка всех трёх
+        create_monitoring_configs
+        start_monitoring_services
+    else
+        ensure_dependencies
+        create_project_dir
+    fi
 
     # Безопасность
     configure_firewall
+
+    # Роль: сертификат и nginx — до remnanode, чтобы на exit-direct
+    # Xray сразу увидел файлы сертификата
+    if role_has_site; then
+        setup_certificates
+        setup_nginx
+    fi
 
     # docker-compose.yml для ноды
     generate_docker_compose
@@ -1905,6 +3022,7 @@ main() {
 
     # Финал
     get_netbird_ip
+    verify_role
     show_next_steps
 
     log "Установка завершена успешно."

@@ -1,5 +1,12 @@
-# Файлы конфигурации с секретами: NetBird setup key, SECRET_KEY ноды.
-# Шаблон без значений лежит в .env.example и коммитится.
+# Файлы конфигурации с секретами: NetBird setup key, SECRET_KEY ноды,
+# ключи CertWarden. Шаблон без значений лежит в .env.example и коммитится.
 .env
 *.env
 !.env.example
+
+# Выгрузка конфигурации панели (tools/rw_export.py) и архивы с ней
+rw-export/
+*.zip
+
+# Резервные копии конфигов, которые делает установщик
+backup-*
