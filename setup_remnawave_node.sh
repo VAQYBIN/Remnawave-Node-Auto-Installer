@@ -51,9 +51,10 @@
 #   - Таймаут на загрузки (wget --timeout)
 #   - Валидация IP-адресов
 #
-# Поддерживает запуск через pipe:
+# Запуск:
 #   curl ... | sudo bash
-#   sudo bash <(curl ...)
+#   curl -fsSL -o setup_remnawave_node.sh <url> && sudo bash setup_remnawave_node.sh
+#   (не sudo bash <(curl ...): под sudo подстановка процесса не работает)
 #####################################################
 
 set -euo pipefail
@@ -135,7 +136,7 @@ VMAGENT_VERSION="1.123.0"
 # Каждый параметр инициализируется как "${VAR:-}", а не пустой
 # строкой: это сохраняет значение, переданное через окружение.
 # Простое VAR="" затёрло бы его, и режим
-#   NETBIRD_SETUP_KEY=xxx sudo bash setup_remnawave_node.sh
+#   sudo NETBIRD_SETUP_KEY=xxx bash setup_remnawave_node.sh
 # перестал бы работать.
 #
 # Источники значений, в порядке убывания приоритета:
@@ -293,8 +294,11 @@ usage() {
 Remnawave Node Auto-Installer
 
 Использование:
-  sudo ./setup_remnawave_node.sh [ОПЦИИ]
-  sudo bash <(curl -fsSL git.new/remnawave-setup) [ОПЦИИ]
+  curl -fsSL -o setup_remnawave_node.sh git.new/remnawave-setup
+  sudo bash setup_remnawave_node.sh [ОПЦИИ]
+
+  Не запускайте через sudo bash <(curl ...): под sudo подстановка
+  процесса не работает (на Ubuntu 26.04 с sudo-rs — никогда)
 
 Опции:
   -c, --config PATH     Путь к файлу конфигурации
@@ -367,20 +371,20 @@ Remnawave Node Auto-Installer
 
 Примеры:
   # Обычная интерактивная установка; ответы сохранятся в .env
-  sudo ./setup_remnawave_node.sh
+  sudo bash setup_remnawave_node.sh
 
   # Полностью автоматическая установка из файла
-  sudo ./setup_remnawave_node.sh --config /root/node.conf --non-interactive
+  sudo bash setup_remnawave_node.sh --config /root/node.conf --non-interactive
 
   # Привести существующую ноду к стандарту роли
-  sudo ./setup_remnawave_node.sh --role-only --config /root/node.conf
+  sudo bash setup_remnawave_node.sh --role-only --config /root/node.conf
 
   # Общие параметры в файле, уникальные — через окружение
   sudo INSTANCE_NAME=de-node-02 SECRET_KEY=xxx \
-       ./setup_remnawave_node.sh --non-interactive
+       bash setup_remnawave_node.sh --non-interactive
 
 Важно: переменные указывайте ПОСЛЕ sudo. Запись вида
-"VAR=x sudo ./script" не сработает — sudo очищает окружение.
+"VAR=x sudo bash script.sh" не сработает — sudo очищает окружение.
 USAGE
 }
 
@@ -558,7 +562,7 @@ save_env_file() {
         echo "#"
         echo "# Файл содержит секреты — держите права 600."
         echo "# Повторная установка с этими параметрами:"
-        echo "#   sudo ./setup_remnawave_node.sh --config $ENV_FILE --non-interactive"
+        echo "#   sudo bash setup_remnawave_node.sh --config $ENV_FILE --non-interactive"
         echo ""
         local key
         for key in "${ENV_KEYS[@]}"; do
@@ -1379,7 +1383,7 @@ wait_for_apt_lock() {
                 holders=$(lock_holders "$lock" | tr '\n' ' ')
                 log_error "Таймаут ${max_wait}с: блокировка $lock не освободилась"
                 log_error "Удерживающие процессы (PID): ${holders:-не определены}"
-                log_error "Попробуйте вручную: systemctl stop unattended-upgrades && sudo ./setup_remnawave_node.sh"
+                log_error "Попробуйте вручную: systemctl stop unattended-upgrades && sudo bash setup_remnawave_node.sh"
                 exit 1
             fi
 
