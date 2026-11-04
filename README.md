@@ -12,6 +12,13 @@
 
 Поддерживаются архитектуры **x86_64 (amd64)** и **aarch64 (arm64)** — нужные бинарники выбираются автоматически.
 
+## 🖥️ Требования
+
+- **ОС:** скрипт проверен на Ubuntu 24.04 и 26.04;
+- **архитектура:** x86_64 (amd64) или aarch64 (arm64);
+- **права:** root или `sudo`;
+- **сеть:** доступ в интернет к GitHub, Docker Hub, ghcr.io и NetBird.
+
 ---
 
 ## 🔑 Подготовка к установке
@@ -113,6 +120,84 @@ chmod +x check_monitoring_status.sh
 # Запустить проверку
 sudo ./check_monitoring_status.sh
 ```
+
+---
+
+## 🧭 Новая нода от начала до конца
+
+Порядок действий для владельца: от пустого сервера до работающей ноды в панели.
+
+**1. Подготовить данные**
+
+- NetBird Setup Key (см. [Получение NetBird Setup Key](#получение-netbird-setup-key));
+- NetBird-IP сервера панели: [app.netbird.io](https://app.netbird.io/) → **Peers**;
+- адрес VictoriaMetrics;
+- SSH-порт сервера;
+- для `entry` и `exit-direct` — домен ноды и сертификат: доступ к CertWarden
+  (параметры `CW_CLIENT_*`) или готовые файлы `fullchain.pem` и `privkey.key`
+  в `/opt/certs/` (`CERT_SOURCE=manual`).
+
+**2. Создать `/root/node.env`**
+
+Роль и обязательные параметры, без `SECRET_KEY`: его панель выдаст позже.
+Полный список — в [`.env.example`](.env.example).
+
+```bash
+cat > /root/node.env <<'EOF'
+NODE_ROLE="exit"
+NETBIRD_SETUP_KEY="..."
+INSTANCE_NAME="de-node-01"
+VICTORIA_METRICS_URL="100.64.0.1"
+PANEL_NETBIRD_IP="100.64.0.5"
+NODE_PORT="2222"
+SSH_PORTS="22"
+# для entry и exit-direct ещё NODE_DOMAIN, CERT_SOURCE и CW_CLIENT_*
+EOF
+chmod 600 /root/node.env
+```
+
+**3. Скачать скрипт и запустить**
+
+```bash
+curl -fsSL -o setup_remnawave_node.sh git.new/remnawave-setup \
+  && sudo bash setup_remnawave_node.sh --config /root/node.env --non-interactive
+```
+
+Без `SECRET_KEY` remnanode не запускается: скрипт пишет в `docker-compose.yml`
+плейсхолдер. Всё остальное (NetBird, Docker, мониторинг, UFW, nginx и сертификат
+для своей роли) ставится полностью.
+
+**4. Переименовать пир в NetBird** по роли: `entry-ru<N>` или `exit-<страна><N>`.
+
+**5. Создать ноду в панели**
+
+- адрес — NetBird-IP из вывода скрипта (не публичный IP);
+- порт — `NODE_PORT`;
+- профиль по роли: `entry-ru`, `exit` или `exit-direct`.
+
+Скопируйте `SECRET_KEY` новой ноды.
+
+**6. Добавить `SECRET_KEY` и запустить скрипт ещё раз**
+
+```bash
+echo 'SECRET_KEY="..."' >> /root/node.env
+sudo bash setup_remnawave_node.sh --role-only --config /root/node.env
+```
+
+`--role-only` не трогает систему, NetBird, Docker и мониторинг, а только
+перезаписывает `docker-compose.yml` с настоящим ключом и запускает remnanode.
+
+**7. Проверить**: нода в панели зелёная, в [итоговой проверке](#итоговая-проверка)
+скрипта нет ✗.
+
+**8. Доделать в панели по роли**
+
+- `exit` — в профиль `entry-ru` добавить аутбаунд `to-...` на эту ноду и
+  служебного пользователя `_bridge-...` в сквад `bridges`;
+- `entry` — добавить домен ноды в `serverNames` инбаунда и создать хост
+  с явно указанным SNI.
+
+Скрипт выводит эти же шаги в конце работы, с уже подставленными NetBird-IP, портом и доменом.
 
 ---
 
