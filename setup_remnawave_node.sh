@@ -166,7 +166,7 @@ TZ="${TZ:-}"                               # часовой пояс окна о
 
 # Значения по умолчанию для необязательных параметров
 DEFAULT_NODE_PORT="2222"
-DEFAULT_REMNANODE_VERSION="3.4.3"
+DEFAULT_REMNANODE_VERSION="3.4.4"
 DEFAULT_XRAY_LOCAL_PORT="10443"
 DEFAULT_SITE_LOCAL_PORT="9443"
 DEFAULT_CW_TIME_START="02:00"
@@ -322,7 +322,7 @@ Remnawave Node Auto-Installer
 
   Необязательные:
     NODE_PORT             Порт для связи с панелью (по умолчанию 2222)
-    REMNANODE_VERSION     Тег образа remnawave/node (по умолчанию 3.4.3)
+    REMNANODE_VERSION     Тег образа remnawave/node (по умолчанию 3.4.4)
     XRAY_LOCAL_PORT       entry: порт Reality на 127.0.0.1 (по умолчанию 10443)
     SITE_LOCAL_PORT       Порт сайта-заглушки на 127.0.0.1 (по умолчанию 9443)
     SSH_PORTS             Порты SSH через пробел, например "22 2233".
