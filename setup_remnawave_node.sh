@@ -96,21 +96,30 @@ CERT_PRIVKEY="privkey.key"
 # по этому пути профиль Hysteria2 в панели ищет fullchain.pem и privkey.key
 REMNANODE_SSL_DIR="/var/lib/remnawave/configs/xray/ssl"
 
-# Образы ролевых компонентов
-NGINX_IMAGE="nginx:alpine"
+# Образы ролевых компонентов — только точные теги, чтобы на всех
+# серверах стояло одно и то же. nginx — стабильная ветка (stable-alpine).
+# certwarden-client v0.5.0: начиная с этой версии клиент понимает
+# CW_CLIENT_CERTCHAIN_PEM_FILENAME / CW_CLIENT_KEY_PEM_FILENAME;
+# v0.4.0 всегда пишет certchain.pem и key.pem
+NGINX_IMAGE="nginx:1.30.6-alpine"
 CERTWARDEN_IMAGE="ghcr.io/gregtwallace/certwarden-client:v0.5.0"
 
 # Откуда брать шаблоны, если скрипт запущен не из клона репозитория
 # (curl ... | bash). Ветку можно переопределить для проверки
-# неслитых изменений: REMNAWAVE_INSTALLER_REF=feature/v4-roles
+# неслитых изменений: REMNAWAVE_INSTALLER_REF=dev
 INSTALLER_REF="${REMNAWAVE_INSTALLER_REF:-main}"
 TEMPLATES_URL="https://raw.githubusercontent.com/VAQYBIN/Remnawave-Node-Auto-Installer/${INSTALLER_REF}/templates"
 
 # Метка для резервных копий конфигов — одна на весь запуск
 BACKUP_STAMP="$(date +%Y%m%d-%H%M%S)"
 
-# Временная директория для параллельных загрузок
-TMP_DIR="/tmp/remnawave_setup_$$"
+# Временная директория для параллельных загрузок и шаблонов.
+# Создаётся в init_tmp_dir через mktemp: предсказуемое имя вида
+# /tmp/remnawave_setup_$$ мог бы заранее создать другой пользователь
+# и подменить скачанные бинарники или шаблоны до того, как root их
+# установит.
+TMP_DIR=""
+TEMPLATE_CACHE=""
 
 # ─────────────────────────────────────────────────
 # Версии компонентов мониторинга
@@ -257,9 +266,24 @@ log_info() {
 # Очистка временных файлов при выходе
 # ─────────────────────────────────────────────────
 cleanup() {
-    rm -rf "$TMP_DIR"
+    [[ -n "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
+    return 0
 }
 trap cleanup EXIT
+
+# ─────────────────────────────────────────────────
+# Создание временной директории
+#
+# mktemp -d создаёт новый каталог с уникальным именем и правами 700,
+# поэтому заранее подготовить или подменить его никто не может.
+# ─────────────────────────────────────────────────
+init_tmp_dir() {
+    if ! TMP_DIR=$(mktemp -d /tmp/remnawave_setup.XXXXXXXX); then
+        log_error "Не удалось создать временную директорию в /tmp"
+        exit 1
+    fi
+    TEMPLATE_CACHE="$TMP_DIR/templates"
+}
 
 # ─────────────────────────────────────────────────
 # Справка по использованию
@@ -1508,7 +1532,6 @@ create_project_dir() {
 # ─────────────────────────────────────────────────
 create_monitoring_dirs() {
     mkdir -p "$MONITORING_DIR"/{cadvisor,nodeexporter,vmagent/conf.d}
-    mkdir -p "$TMP_DIR"  # временная директория для параллельных загрузок
     log "✓ Созданы директории для мониторинга"
 }
 
@@ -2236,10 +2259,180 @@ check_container_owner() {
 }
 
 # ─────────────────────────────────────────────────
+# Образы, нужные роли
+# ─────────────────────────────────────────────────
+role_images() {
+    echo "remnawave/node:${REMNANODE_VERSION}"
+    if role_has_site; then
+        echo "$NGINX_IMAGE"
+        [[ "$CERT_SOURCE" == "certwarden" ]] && echo "$CERTWARDEN_IMAGE"
+    fi
+    return 0
+}
+
+# ─────────────────────────────────────────────────
+# Есть ли тег в реестре — через HTTP API, без Docker
+#
+# Нужно для полной установки: на этапе предпроверок Docker ещё не
+# установлен. Поддерживаются Docker Hub и ghcr.io — других
+# реестров скрипт не использует.
+# Возвращает 0 — тег есть, 1 — тега нет, 2 — проверить не удалось.
+# ─────────────────────────────────────────────────
+registry_tag_exists() {
+    local ref="$1" name tag registry repo auth_url api_host
+
+    name="${ref%:*}"
+    tag="${ref##*:}"
+    if [[ "$name" == */* && "${name%%/*}" == *.* ]]; then
+        registry="${name%%/*}"
+        repo="${name#*/}"
+    else
+        registry="docker.io"
+        repo="$name"
+        [[ "$repo" == */* ]] || repo="library/$repo"
+    fi
+
+    case "$registry" in
+        docker.io)
+            auth_url="https://auth.docker.io/token?service=registry.docker.io&scope=repository:${repo}:pull"
+            api_host="registry-1.docker.io"
+            ;;
+        ghcr.io)
+            auth_url="https://ghcr.io/token?scope=repository:${repo}:pull"
+            api_host="ghcr.io"
+            ;;
+        *)
+            return 2
+            ;;
+    esac
+
+    local token code
+    # --retry: разовый сбой реестра не должен останавливать установку
+    token=$(curl -fsS --retry 3 --retry-all-errors --connect-timeout 15 --max-time 30 "$auth_url" 2>/dev/null \
+            | grep -oP '"token"\s*:\s*"\K[^"]+' | head -n1) || true
+    [[ -n "$token" ]] || return 2
+
+    # Заголовок Accept со всеми форматами: мультиарх-образы отдают
+    # индекс, обычные — манифест, без нужного типа реестр ответит 404
+    code=$(curl -sS -o /dev/null -w '%{http_code}' -I --retry 3 --connect-timeout 15 --max-time 30 \
+            -H "Authorization: Bearer $token" \
+            -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json" \
+            "https://${api_host}/v2/${repo}/manifests/${tag}" 2>/dev/null) || true
+
+    case "$code" in
+        200) return 0 ;;
+        404) return 1 ;;
+        *)   return 2 ;;
+    esac
+}
+
+# ─────────────────────────────────────────────────
+# Проверка, что все образы роли существуют
+#
+# Опечатка в REMNANODE_VERSION или исчезнувший тег иначе всплыли бы
+# только на docker compose up — после того как сервер уже изменён.
+# Если Docker установлен, проверяем через docker manifest inspect,
+# иначе (полная установка) — через HTTP API реестра.
+# Возвращает 1, если хотя бы одного образа нет или проверка не удалась.
+# ─────────────────────────────────────────────────
+check_role_images() {
+    local image rc out failed=0
+
+    while read -r image; do
+        [[ -z "$image" ]] && continue
+
+        if command -v docker &> /dev/null; then
+            # Вторая попытка — на случай разового сбоя реестра; при
+            # «no such manifest» повторять бессмысленно
+            if out=$(docker manifest inspect "$image" 2>&1 >/dev/null) \
+                || { [[ "$out" != *"no such manifest"* ]] && sleep 3 \
+                     && out=$(docker manifest inspect "$image" 2>&1 >/dev/null); }; then
+                log_info "✓ Образ $image есть в реестре"
+                continue
+            fi
+            log_error "Образ $image не найден в реестре или реестр недоступен"
+            log_error "   docker manifest inspect: $(head -n1 <<< "$out")"
+            failed=1
+            continue
+        fi
+
+        if ! command -v curl &> /dev/null; then
+            log_error "Нечем проверить образ $image: нет ни docker, ни curl (apt install -y curl)"
+            failed=1
+            continue
+        fi
+
+        rc=0
+        registry_tag_exists "$image" || rc=$?
+        case "$rc" in
+            0) log_info "✓ Образ $image есть в реестре" ;;
+            1) log_error "Образа $image нет в реестре — проверьте тег"; failed=1 ;;
+            *) log_error "Не удалось проверить образ $image: реестр недоступен"; failed=1 ;;
+        esac
+    done < <(role_images)
+
+    return "$failed"
+}
+
+# ─────────────────────────────────────────────────
+# Загрузка и проверка шаблонов роли
+#
+# Шаблоны скачиваются заранее, в предпроверках: при запуске через
+# curl | bash из ветки, где шаблонов нет (или опечатка в
+# REMNAWAVE_INSTALLER_REF), установка остановится до изменений,
+# а не на шаге nginx. setup_nginx берёт уже проверенные файлы.
+# Возвращает 1, если какой-то шаблон не получен или повреждён.
+# ─────────────────────────────────────────────────
+prefetch_role_templates() {
+    role_has_site || return 0
+
+    mkdir -p "$TEMPLATE_CACHE/nginx" "$TEMPLATE_CACHE/site"
+
+    # Для скачивания нужен загрузчик; ensure_dependencies ещё не
+    # запускался, поэтому выбираем из того, что уже есть
+    if [[ -z "$DOWNLOADER" ]]; then
+        if command -v curl &> /dev/null; then
+            DOWNLOADER="curl"
+        elif command -v wget &> /dev/null; then
+            DOWNLOADER="wget"
+        fi
+    fi
+
+    local conf_rel="nginx/${NODE_ROLE}.conf.tpl"
+    local failed=0 marker
+
+    if ! fetch_template "$conf_rel" "$TEMPLATE_CACHE/$conf_rel"; then
+        failed=1
+    else
+        # Ошибка вида 404-страницы или обрезанный файл не должны
+        # пройти как шаблон: проверяем обязательные подстановки
+        local markers=("{{NODE_DOMAIN}}" "{{SITE_LOCAL_PORT}}" "http {")
+        [[ "$NODE_ROLE" == "entry" ]] && markers+=("{{XRAY_LOCAL_PORT}}" "stream {")
+        for marker in "${markers[@]}"; do
+            if ! grep -qF "$marker" "$TEMPLATE_CACHE/$conf_rel"; then
+                log_error "Шаблон $conf_rel повреждён: нет '$marker'"
+                failed=1
+            fi
+        done
+    fi
+
+    if ! fetch_template site/index.html "$TEMPLATE_CACHE/site/index.html"; then
+        failed=1
+    elif ! grep -qi '</html>' "$TEMPLATE_CACHE/site/index.html"; then
+        log_error "Шаблон site/index.html повреждён: нет </html>"
+        failed=1
+    fi
+
+    (( failed == 0 )) && log_info "✓ Шаблоны роли получены и проверены"
+    return "$failed"
+}
+
+# ─────────────────────────────────────────────────
 # Предпроверки роли — до любых изменений на сервере
 #
-# Выполняются сразу после разбора параметров, чтобы занятый порт
-# или чужой контейнер обнаружились до долгой базовой установки.
+# Выполняются сразу после разбора параметров, чтобы занятый порт,
+# чужой контейнер, несуществующий образ или недоступный шаблон
+# обнаружились до долгой базовой установки.
 # ─────────────────────────────────────────────────
 preflight_role() {
     log "Предпроверки роли $NODE_ROLE..."
@@ -2290,9 +2483,12 @@ preflight_role() {
         fi
     done
 
+    check_role_images || failed=1
+    prefetch_role_templates || failed=1
+
     if (( failed == 1 )); then
         log_error "Предпроверки не пройдены — на сервере ничего не изменено"
-        log_error "Освободите порты или уберите конфликтующие контейнеры и запустите скрипт снова"
+        log_error "Исправьте пункты выше и запустите скрипт снова"
         exit 1
     fi
     log_info "✓ Предпроверки пройдены"
@@ -2380,9 +2576,15 @@ fetch_template() {
         fi
     fi
 
+    if [[ -z "$DOWNLOADER" ]]; then
+        log_error "Шаблон $rel не найден рядом со скриптом, а скачать его нечем: нужен curl или wget"
+        return 1
+    fi
     if ! download_file "$TEMPLATES_URL/$rel" "$dest" >> "$LOG_FILE" 2>&1; then
+        rm -f "$dest"
         log_error "Не удалось получить шаблон $rel ($TEMPLATES_URL/$rel)"
-        exit 1
+        log_error "Для проверки неслитой ветки укажите её: REMNAWAVE_INSTALLER_REF=dev"
+        return 1
     fi
 }
 
@@ -2555,7 +2757,7 @@ setup_nginx() {
 
     # Сайт-заглушка — только в пустую папку: свой сайт владельца не трогаем
     if [[ -z "$(ls -A "$NGINX_DIR/html" 2>/dev/null)" ]]; then
-        fetch_template site/index.html "$NGINX_DIR/html/index.html"
+        cp "$TEMPLATE_CACHE/site/index.html" "$NGINX_DIR/html/index.html"
         chmod 644 "$NGINX_DIR/html/index.html"
         log_info "✓ Сайт-заглушка положен в $NGINX_DIR/html/"
     else
@@ -2565,7 +2767,8 @@ setup_nginx() {
     # Шаблон → конфиг. Значения проверены в resolve_params (домен —
     # только [a-z0-9.-], порты — числа), поэтому sed безопасен
     local tmp_conf="$NGINX_DIR/.nginx.conf.tmp"
-    fetch_template "nginx/${NODE_ROLE}.conf.tpl" "$tmp_conf"
+    # Шаблон получен и проверен в предпроверках (prefetch_role_templates)
+    cp "$TEMPLATE_CACHE/nginx/${NODE_ROLE}.conf.tpl" "$tmp_conf"
     sed -i \
         -e "s/{{NODE_DOMAIN}}/${NODE_DOMAIN}/g" \
         -e "s/{{XRAY_LOCAL_PORT}}/${XRAY_LOCAL_PORT}/g" \
@@ -2972,6 +3175,7 @@ main() {
     # "Permission denied" вместо понятного сообщения
     check_root
     touch "$LOG_FILE"
+    init_tmp_dir
 
     load_env_file
     detect_arch

@@ -86,6 +86,25 @@ sudo ./setup_remnawave_node.sh --role-only --config /root/node.env
 
 Подробнее — в разделе [Режим --role-only](#режим---role-only).
 
+### Проверка неслитой ветки
+
+Новые версии сначала попадают в ветку `dev`, а в `main` переносятся после
+проверки. Короткая ссылка `git.new/remnawave-setup` и шаблоны по умолчанию
+берутся из `main`. Чтобы проверить `dev` на тестовом сервере, возьмите скрипт
+из этой ветки и укажите её же для шаблонов (`templates/`):
+
+```bash
+sudo REMNAWAVE_INSTALLER_REF=dev bash <(curl -fsSL \
+  https://raw.githubusercontent.com/VAQYBIN/Remnawave-Node-Auto-Installer/dev/setup_remnawave_node.sh) \
+  --config /root/node.env --non-interactive
+```
+
+Без `REMNAWAVE_INSTALLER_REF=dev` скрипт из `dev` будет скачивать шаблоны
+из `main`. Если их там нет, установка остановится на предпроверках, до
+каких-либо изменений на сервере. Если в `main` лежит старая версия
+шаблонов, скрипт этого не заметит, поэтому переменную лучше не забывать. В клоне репозитория
+переменная не нужна: шаблоны берутся из папки `templates/` рядом со скриптом.
+
 ### Скрипт проверки статуса
 
 ```bash
@@ -210,6 +229,13 @@ cp privkey.key   /opt/certs/privkey.key     # приватный ключ
   и скрипт тоже остановится.
 - **Старые контейнеры** ручной установки (`remnawave-nginx`, `certwardenclient`):
   о них скрипт только предупреждает.
+- **Образы роли есть в реестре**: `remnawave/node:REMNANODE_VERSION`, nginx и
+  certwarden-client. Если Docker уже установлен, проверка идёт через
+  `docker manifest inspect`. При полной установке Docker ещё нет, поэтому
+  скрипт обращается к HTTP API Docker Hub и ghcr.io через `curl`.
+- **Шаблоны роли** скачиваются и проверяются заранее: в шаблоне nginx должны
+  быть все подстановки, в сайте — `</html>`. Дальше установка берёт уже
+  проверенные файлы.
 
 ### Режим --role-only
 
@@ -277,7 +303,8 @@ docker rm remnawave-nginx certwardenclient
 
 #### Роль (`entry`, `exit-direct`):
 9. 🔐 Сертификат в `/opt/certs` — CertWarden-клиент или файлы вручную
-10. 🌐 nginx (`nginx:alpine`, `network_mode: host`) по шаблону роли и сайт-заглушка
+10. 🌐 nginx (`nginx:1.30.6-alpine`, стабильная ветка, `network_mode: host`) по шаблону
+    роли и сайт-заглушка
 
 ### Интерактивные параметры:
 
@@ -941,7 +968,9 @@ sudo ./setup_remnawave_node.sh --role-only --config /opt/remnawave-installer/.en
 - ✨ Сертификаты: CertWarden-клиент или файлы, положенные вручную. Проверка срока,
   соответствия ключа и домена
 - ✨ Режим `--role-only` для приведения существующих нод к стандарту
-- ✨ Предпроверки занятых портов и чужих контейнеров до любых изменений
+- ✨ Предпроверки до любых изменений: занятые порты, чужие контейнеры,
+  наличие образов роли в реестре, загрузка и целостность шаблонов
+- 🔧 Все образы закреплены: `nginx:1.30.6-alpine`, `certwarden-client:v0.5.0`
 - ✨ Итоговая проверка с отчётом ✓ / ✗ и подсказкой, что сделать в панели
 - 🔧 Образ `remnawave/node` фиксируется по версии (`REMNANODE_VERSION`), `latest` больше
   не используется
