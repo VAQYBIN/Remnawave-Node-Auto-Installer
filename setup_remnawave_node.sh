@@ -184,13 +184,14 @@ DEFAULT_CW_TIME_END="03:00"
 DEFAULT_CW_DAYS="Mon Tue Wed Thu Fri Sat Sun"
 DEFAULT_TZ="Europe/Moscow"
 
-# Порт моста (инбаунд bridge-in на выходах). Работает только через
-# NetBird, в UFW не открывается ни в одной роли.
+# Порт моста (инбаунд bridge-in на exit и exit-direct). Разрешается
+# в UFW только на интерфейсе NetBird, для всех он не открывается.
 BRIDGE_PORT="10443"
 
 # Вычисляются в процессе работы
 NETBIRD_IP=""
 NETBIRD_FQDN=""
+NETBIRD_IFACE=""      # интерфейс с NETBIRD_IP, обычно wt0
 ARCH_SUFFIX=""        # Определяется автоматически
 SSH_PORT_LIST=()      # Итоговый список портов для правил UFW
 DOWNLOADER=""         # "curl" или "wget" — выбирается по факту наличия
@@ -328,8 +329,8 @@ Remnawave Node Auto-Installer
                Сертификат монтируется в remnanode. Открыто для всех:
                443/tcp, 443/udp, 8443/tcp, 80/tcp
 
-  Порт моста 10443/tcp не открывается ни в одной роли: мост
-  работает через NetBird.
+  Порт моста 10443/tcp на exit и exit-direct разрешён только на
+  интерфейсе NetBird (обычно wt0), для всех он не открывается.
 
 Параметры конфигурации (файл .env или переменные окружения):
 
@@ -2070,6 +2071,43 @@ prune_role_rules() {
 }
 
 # ─────────────────────────────────────────────────
+# Правило моста: BRIDGE_PORT разрешён только на интерфейсе NetBird
+#
+# На Ubuntu 26.04 (nftables) разрешающие правила NetBird не обходят
+# UFW: SYN с входной ноды приходят на wt0 и отбрасываются. Поэтому
+# правило ставится явно, на всех версиях. На серверах с iptables,
+# где NetBird и так пропускает трафик раньше UFW, оно ничего не меняет.
+# ─────────────────────────────────────────────────
+UFW_BRIDGE_COMMENT="Remnawave bridge (NetBird)"
+
+role_has_bridge() {
+    [[ "$NODE_ROLE" == "exit" || "$NODE_ROLE" == "exit-direct" ]]
+}
+
+# Удаляет правила моста, которые не нужны: роль без моста или
+# правило на другом интерфейсе (например, после смены имени)
+prune_bridge_rules() {
+    local line num iface guard=0
+    while (( guard < 20 )); do
+        guard=$(( guard + 1 ))
+        num=""
+        while IFS= read -r line; do
+            [[ "$line" == *"# ${UFW_BRIDGE_COMMENT}" ]] || continue
+            [[ "$line" =~ ^\[\ *([0-9]+)\]\ +[0-9]+/tcp(\ \(v6\))?\ on\ ([^[:space:]]+) ]] || continue
+            iface="${BASH_REMATCH[3]}"
+            if ! role_has_bridge || [[ "$iface" != "$NETBIRD_IFACE" ]]; then
+                num="${BASH_REMATCH[1]}"
+                break
+            fi
+        done < <(ufw status numbered 2>/dev/null)
+
+        [[ -z "$num" ]] && break
+        ufw --force delete "$num" >> "$LOG_FILE" 2>&1
+        log_info "✓ Удалено правило моста UFW: ${BRIDGE_PORT}/tcp on $iface"
+    done
+}
+
+# ─────────────────────────────────────────────────
 # Настройка UFW Firewall
 #
 # Публичные порты задаёт роль (role_public_ports). NODE_PORT
@@ -2104,8 +2142,7 @@ configure_firewall() {
 
     # Публичные порты роли. Правила прошлых запусков, которых нет в
     # наборе текущей роли, удаляются — так --role-only приводит ноду
-    # к стандарту. BRIDGE_PORT не открывается никогда: мост идёт
-    # через NetBird, а его правила стоят раньше UFW
+    # к стандарту. BRIDGE_PORT для всех не открывается никогда
     local rule
     prune_role_rules
     for rule in $(role_public_ports); do
@@ -2114,6 +2151,14 @@ configure_firewall() {
     done
     if [[ -z "$(role_public_ports)" ]]; then
         log_info "Роль $NODE_ROLE: публичных портов нет, трафик приходит по NetBird"
+    fi
+
+    # Мост — только на интерфейсе NetBird
+    prune_bridge_rules
+    if role_has_bridge; then
+        ufw allow in on "$NETBIRD_IFACE" to any port "$BRIDGE_PORT" proto tcp \
+            comment "$UFW_BRIDGE_COMMENT" >> "$LOG_FILE" 2>&1
+        log_info "✓ ${BRIDGE_PORT}/tcp (мост): разрешён только на $NETBIRD_IFACE (NetBird)"
     fi
 
     # Включаем UFW (echo y — автоматически соглашаемся на предупреждение)
@@ -2149,12 +2194,31 @@ get_netbird_ip() {
 
     NETBIRD_FQDN=$(netbird status 2>/dev/null | grep -oP '^FQDN:\s+\K\S+' || true)
 
+    # Интерфейс берём по адресу: имя wt0 — только значение по умолчанию
+    NETBIRD_IFACE=""
+    [[ -n "$NETBIRD_IP" ]] && NETBIRD_IFACE=$(netbird_iface_by_ip "$NETBIRD_IP")
+
     if [[ -n "$NETBIRD_IP" ]]; then
         log "✓ NetBird IP: ${GREEN}$NETBIRD_IP${NC}"
     else
         log_warning "Не удалось автоматически определить NetBird IP"
         log_info "Запустите вручную: netbird status"
     fi
+    if [[ -n "$NETBIRD_IFACE" ]]; then
+        log_info "Интерфейс NetBird: $NETBIRD_IFACE"
+    else
+        NETBIRD_IFACE="wt0"
+        log_warning "Интерфейс с NetBird IP не найден в ip -br a, используем $NETBIRD_IFACE"
+    fi
+}
+
+# Имя интерфейса, на котором висит адрес. Вывод ip -br a:
+#   wt0   UNKNOWN   100.64.1.2/16
+netbird_iface_by_ip() {
+    local ip="$1"
+    ip -br a 2>/dev/null | awk -v ip="$ip" '{
+        for (i = 3; i <= NF; i++) { split($i, a, "/"); if (a[1] == ip) { sub(/@.*/, "", $1); print $1; exit } }
+    }'
 }
 
 # ═════════════════════════════════════════════════
@@ -2966,6 +3030,8 @@ report_check() {
     local ok="$1" text="$2"
     if [[ "$ok" == "ok" ]]; then
         echo -e "   ${GREEN}✓${NC} $text" | tee -a "$LOG_FILE"
+    elif [[ "$ok" == "skip" ]]; then
+        echo -e "   ${YELLOW}–${NC} $text" | tee -a "$LOG_FILE"
     else
         echo -e "   ${RED}✗${NC} $text" | tee -a "$LOG_FILE"
         VERIFY_FAILED=$(( VERIFY_FAILED + 1 ))
@@ -3046,11 +3112,32 @@ verify_role() {
             ;;
     esac
 
-    # Порт моста не должен быть разрешён в UFW
-    if ufw status 2>/dev/null | grep -qE "^${BRIDGE_PORT}(/(tcp|udp))?[[:space:]]"; then
-        report_check fail "${BRIDGE_PORT} разрешён в UFW — мост должен идти только через NetBird (ufw status numbered)"
+    # Порт моста: ошибка — только разрешение без привязки к
+    # интерфейсу (открыт для всех). Правило "on wt0" — норма
+    local ufw_out
+    ufw_out=$(ufw status 2>/dev/null || true)
+    if grep -qE "^${BRIDGE_PORT}(/(tcp|udp))?( \(v6\))?[[:space:]]+(ALLOW|LIMIT)" <<< "$ufw_out"; then
+        report_check fail "${BRIDGE_PORT} разрешён в UFW без привязки к интерфейсу — мост открыт для всех (ufw status numbered)"
     else
-        report_check ok "${BRIDGE_PORT} в UFW не разрешён"
+        report_check ok "${BRIDGE_PORT} не разрешён в UFW для всех"
+    fi
+    if role_has_bridge; then
+        if grep -qE "^${BRIDGE_PORT}/tcp on ${NETBIRD_IFACE}[[:space:]]+(ALLOW|LIMIT)" <<< "$ufw_out"; then
+            report_check ok "${BRIDGE_PORT}/tcp разрешён на интерфейсе NetBird ${NETBIRD_IFACE}"
+        else
+            report_check fail "нет правила UFW: ${BRIDGE_PORT}/tcp on ${NETBIRD_IFACE}"
+        fi
+        # Мост слушает NetBird-IP. Подключение с самой ноды идёт через
+        # lo, поэтому проверяет слушателя, а не правило UFW на wt0
+        if [[ -z "$SECRET_KEY" ]]; then
+            report_check skip "мост на NetBird-IP: пропущено, remnanode без SECRET_KEY не запущен"
+        elif [[ -z "$NETBIRD_IP" ]]; then
+            report_check fail "мост на NetBird-IP: NetBird IP не определён"
+        elif timeout 3 bash -c "</dev/tcp/${NETBIRD_IP}/${BRIDGE_PORT}" 2>/dev/null; then
+            report_check ok "мост принимает подключения на ${NETBIRD_IP}:${BRIDGE_PORT}"
+        else
+            report_check fail "мост не принимает подключения на ${NETBIRD_IP}:${BRIDGE_PORT} — нода в панели с профилем ${NODE_ROLE}, инбаунд bridge-in на ${BRIDGE_PORT}?"
+        fi
     fi
 
     # NetBird
@@ -3140,7 +3227,11 @@ show_next_steps() {
     else
         echo -e "   ✓ Публичных портов нет"
     fi
-    echo -e "   ✓ ${BRIDGE_PORT}/tcp (мост) — не открыт, работает через NetBird"
+    if role_has_bridge; then
+        echo -e "   ✓ ${BRIDGE_PORT}/tcp (мост) — только на ${NETBIRD_IFACE} (NetBird)"
+    else
+        echo -e "   ✓ ${BRIDGE_PORT}/tcp (мост) — не открыт"
+    fi
     echo ""
 
     show_panel_hints
@@ -3221,6 +3312,9 @@ main() {
         create_project_dir
     fi
 
+    # NetBird IP и интерфейс нужны правилу моста в UFW
+    get_netbird_ip
+
     # Безопасность
     configure_firewall
 
@@ -3241,7 +3335,6 @@ main() {
     fi
 
     # Финал
-    get_netbird_ip
     verify_role
     show_next_steps
 
