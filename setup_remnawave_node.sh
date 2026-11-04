@@ -113,8 +113,13 @@ TEMPLATES_URL="https://raw.githubusercontent.com/VAQYBIN/Remnawave-Node-Auto-Ins
 # Метка для резервных копий конфигов — одна на весь запуск
 BACKUP_STAMP="$(date +%Y%m%d-%H%M%S)"
 
-# Временная директория для параллельных загрузок
-TMP_DIR="/tmp/remnawave_setup_$$"
+# Временная директория для параллельных загрузок и шаблонов.
+# Создаётся в init_tmp_dir через mktemp: предсказуемое имя вида
+# /tmp/remnawave_setup_$$ мог бы заранее создать другой пользователь
+# и подменить скачанные бинарники или шаблоны до того, как root их
+# установит.
+TMP_DIR=""
+TEMPLATE_CACHE=""
 
 # ─────────────────────────────────────────────────
 # Версии компонентов мониторинга
@@ -261,9 +266,24 @@ log_info() {
 # Очистка временных файлов при выходе
 # ─────────────────────────────────────────────────
 cleanup() {
-    rm -rf "$TMP_DIR"
+    [[ -n "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
+    return 0
 }
 trap cleanup EXIT
+
+# ─────────────────────────────────────────────────
+# Создание временной директории
+#
+# mktemp -d создаёт новый каталог с уникальным именем и правами 700,
+# поэтому заранее подготовить или подменить его никто не может.
+# ─────────────────────────────────────────────────
+init_tmp_dir() {
+    if ! TMP_DIR=$(mktemp -d /tmp/remnawave_setup.XXXXXXXX); then
+        log_error "Не удалось создать временную директорию в /tmp"
+        exit 1
+    fi
+    TEMPLATE_CACHE="$TMP_DIR/templates"
+}
 
 # ─────────────────────────────────────────────────
 # Справка по использованию
@@ -1512,7 +1532,6 @@ create_project_dir() {
 # ─────────────────────────────────────────────────
 create_monitoring_dirs() {
     mkdir -p "$MONITORING_DIR"/{cadvisor,nodeexporter,vmagent/conf.d}
-    mkdir -p "$TMP_DIR"  # временная директория для параллельных загрузок
     log "✓ Созданы директории для мониторинга"
 }
 
@@ -2288,13 +2307,14 @@ registry_tag_exists() {
     esac
 
     local token code
-    token=$(curl -fsS --connect-timeout 15 --max-time 30 "$auth_url" 2>/dev/null \
+    # --retry: разовый сбой реестра не должен останавливать установку
+    token=$(curl -fsS --retry 3 --retry-all-errors --connect-timeout 15 --max-time 30 "$auth_url" 2>/dev/null \
             | grep -oP '"token"\s*:\s*"\K[^"]+' | head -n1) || true
     [[ -n "$token" ]] || return 2
 
     # Заголовок Accept со всеми форматами: мультиарх-образы отдают
     # индекс, обычные — манифест, без нужного типа реестр ответит 404
-    code=$(curl -sS -o /dev/null -w '%{http_code}' -I --connect-timeout 15 --max-time 30 \
+    code=$(curl -sS -o /dev/null -w '%{http_code}' -I --retry 3 --connect-timeout 15 --max-time 30 \
             -H "Authorization: Bearer $token" \
             -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json" \
             "https://${api_host}/v2/${repo}/manifests/${tag}" 2>/dev/null) || true
@@ -2322,7 +2342,11 @@ check_role_images() {
         [[ -z "$image" ]] && continue
 
         if command -v docker &> /dev/null; then
-            if out=$(docker manifest inspect "$image" 2>&1 >/dev/null); then
+            # Вторая попытка — на случай разового сбоя реестра; при
+            # «no such manifest» повторять бессмысленно
+            if out=$(docker manifest inspect "$image" 2>&1 >/dev/null) \
+                || { [[ "$out" != *"no such manifest"* ]] && sleep 3 \
+                     && out=$(docker manifest inspect "$image" 2>&1 >/dev/null); }; then
                 log_info "✓ Образ $image есть в реестре"
                 continue
             fi
@@ -2359,8 +2383,6 @@ check_role_images() {
 # а не на шаге nginx. setup_nginx берёт уже проверенные файлы.
 # Возвращает 1, если какой-то шаблон не получен или повреждён.
 # ─────────────────────────────────────────────────
-TEMPLATE_CACHE="$TMP_DIR/templates"
-
 prefetch_role_templates() {
     role_has_site || return 0
 
@@ -3153,6 +3175,7 @@ main() {
     # "Permission denied" вместо понятного сообщения
     check_root
     touch "$LOG_FILE"
+    init_tmp_dir
 
     load_env_file
     detect_arch
