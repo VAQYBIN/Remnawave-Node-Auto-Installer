@@ -50,38 +50,32 @@
 
 ## 🚀 Быстрый старт
 
-### Вариант 1: Одной командой (рекомендуется)
+### Вариант 1: Скачать и запустить
 
 ```bash
-bash <(curl -fsSL git.new/remnawave-setup)
+curl -fsSL -o setup_remnawave_node.sh git.new/remnawave-setup && sudo bash setup_remnawave_node.sh
 ```
 
-### Вариант 2: Скачать и запустить
+**⚠️ Не запускайте через `sudo bash <(curl ...)`.** Под `sudo` подстановка процесса
+не работает: `/dev/fd/63` открыт в оболочке пользователя, а не в процессе от root.
+На Ubuntu 26.04 с `sudo-rs` такой запуск падает всегда, на других системах
+зависит от настроек `sudo`. Скачайте скрипт файлом, как в примерах ниже.
 
-```bash
-# Скачать скрипт
-curl -fsSL git.new/remnawave-setup -o setup_remnawave_node.sh
+**💡 Совет:** Интерактивный ввод работает во всех вариантах, ответы читаются из `/dev/tty`.
 
-# Сделать исполняемым и запустить
-chmod +x setup_remnawave_node.sh
-sudo ./setup_remnawave_node.sh
-```
-
-**💡 Совет:** Все варианты поддерживают интерактивный ввод благодаря использованию `/dev/tty`.
-
-### Вариант 3: Без вопросов, из файла конфигурации
+### Вариант 2: Без вопросов, из файла конфигурации
 
 Для раскатки нескольких нод параметры задаются заранее, и скрипт отрабатывает
 целиком без ручного ввода — см. раздел [Неинтерактивный режим](#-неинтерактивный-режим).
 
 ```bash
-sudo ./setup_remnawave_node.sh --config /root/node.env --non-interactive
+sudo bash setup_remnawave_node.sh --config /root/node.env --non-interactive
 ```
 
-### Вариант 4: Привести существующую ноду к стандарту роли
+### Вариант 3: Привести существующую ноду к стандарту роли
 
 ```bash
-sudo ./setup_remnawave_node.sh --role-only --config /root/node.env
+sudo bash setup_remnawave_node.sh --role-only --config /root/node.env
 ```
 
 Подробнее — в разделе [Режим --role-only](#режим---role-only).
@@ -94,10 +88,14 @@ sudo ./setup_remnawave_node.sh --role-only --config /root/node.env
 из этой ветки и укажите её же для шаблонов (`templates/`):
 
 ```bash
-sudo REMNAWAVE_INSTALLER_REF=dev bash <(curl -fsSL \
-  https://raw.githubusercontent.com/VAQYBIN/Remnawave-Node-Auto-Installer/dev/setup_remnawave_node.sh) \
+curl -fsSL -o setup_remnawave_node.sh \
+  https://raw.githubusercontent.com/VAQYBIN/Remnawave-Node-Auto-Installer/dev/setup_remnawave_node.sh \
+  && sudo REMNAWAVE_INSTALLER_REF=dev bash setup_remnawave_node.sh \
   --config /root/node.env --non-interactive
 ```
+
+Переменная `REMNAWAVE_INSTALLER_REF=dev` пишется после `sudo`, перед `bash`:
+`sudo` очищает окружение, и переменная, указанная до него, до скрипта не дойдёт.
 
 Без `REMNAWAVE_INSTALLER_REF=dev` скрипт из `dev` будет скачивать шаблоны
 из `main`. Если их там нет, установка остановится на предпроверках, до
@@ -261,7 +259,7 @@ cp privkey.key   /opt/certs/privkey.key     # приватный ключ
 ```bash
 # пример для существующей входной ноды
 docker stop remnawave-nginx certwardenclient
-sudo ./setup_remnawave_node.sh --role-only --config /root/node.env
+sudo bash setup_remnawave_node.sh --role-only --config /root/node.env
 # убедившись, что всё работает:
 docker rm remnawave-nginx certwardenclient
 ```
@@ -685,10 +683,10 @@ Xray задаёт профиль в панели), а правила UFW теп�
 
 ```bash
 sudo INSTANCE_NAME=de-node-02 SECRET_KEY=xxx \
-     ./setup_remnawave_node.sh --config /root/common.env --non-interactive
+     bash setup_remnawave_node.sh --config /root/common.env --non-interactive
 ```
 
-> **⚠️ Переменные пишите ПОСЛЕ `sudo`.** Запись `VAR=x sudo ./script` не сработает:
+> **⚠️ Переменные пишите ПОСЛЕ `sudo`.** Запись `VAR=x sudo bash script.sh` не сработает:
 > `sudo` по умолчанию очищает окружение (`env_reset`), и до скрипта переменная
 > не долетит.
 
@@ -737,7 +735,8 @@ SSH_PORTS="22"
 for host in de-node-01 fi-node-02 nl-node-03; do
     scp common.env "root@$host:/root/common.env"
     ssh "root@$host" "chmod 600 /root/common.env && \
-        INSTANCE_NAME=$host bash <(curl -fsSL git.new/remnawave-setup) \
+        curl -fsSL -o /root/setup_remnawave_node.sh git.new/remnawave-setup && \
+        INSTANCE_NAME=$host bash /root/setup_remnawave_node.sh \
         --config /root/common.env --non-interactive"
 done
 ```
@@ -946,7 +945,7 @@ systemctl status cadvisor
 изменения:
 
 ```bash
-sudo ./setup_remnawave_node.sh --role-only --config /opt/remnawave-installer/.env
+sudo bash setup_remnawave_node.sh --role-only --config /opt/remnawave-installer/.env
 ```
 
 Скрипт сохранит старый `docker-compose.yml` в `backup-<дата>/` и пересоздаст
