@@ -2307,24 +2307,38 @@ preflight_role() {
 # а не через mv: файл может быть смонтирован в контейнер по
 # отдельности, и после mv контейнер продолжал бы видеть старый.
 #
-# Аргументы: временный файл, целевой путь, директория компонента.
+# Резервные копии могут содержать секреты (SECRET_KEY, ключи
+# CertWarden), а старый файл мог лежать с правами 644 — поэтому
+# каталог копий создаётся с 700, а сама копия получает 600.
+#
+# Аргументы: временный файл, целевой путь, директория компонента,
+# необязательные права целевого файла (выставляются до записи).
 # ─────────────────────────────────────────────────
 install_config() {
-    local src="$1" dest="$2" comp_dir="$3"
+    local src="$1" dest="$2" comp_dir="$3" mode="${4:-}"
 
     if [[ -f "$dest" ]] && cmp -s "$src" "$dest"; then
         rm -f "$src"
+        [[ -n "$mode" ]] && chmod "$mode" "$dest"
         log_info "Без изменений: $dest"
         return 1
     fi
 
     if [[ -f "$dest" ]]; then
         local backup_dir="$comp_dir/backup-$BACKUP_STAMP"
+        local backup_file
+        backup_file="$backup_dir/$(basename "$dest")"
         mkdir -p "$backup_dir"
-        cp -p "$dest" "$backup_dir/"
-        log_info "Старая версия сохранена: $backup_dir/$(basename "$dest")"
+        chmod 700 "$backup_dir"
+        install -m 600 "$dest" "$backup_file"
+        log_info "Старая версия сохранена: $backup_file"
     fi
 
+    # Права — до записи, чтобы секреты не полежали с правами по умолчанию
+    if [[ -n "$mode" ]]; then
+        [[ -e "$dest" ]] || : > "$dest"
+        chmod "$mode" "$dest"
+    fi
     cat "$src" > "$dest"
     rm -f "$src"
     log_info "✓ Записан: $dest"
@@ -2470,9 +2484,7 @@ services:
 EOF
 
     local compose="$CERTWARDEN_DIR/docker-compose.yml"
-    install_config "$tmp" "$compose" "$CERTWARDEN_DIR" || true
-    chmod 600 "$compose"
-    find "$CERTWARDEN_DIR" -maxdepth 2 -name 'docker-compose.yml' -path '*/backup-*' -exec chmod 600 {} +
+    install_config "$tmp" "$compose" "$CERTWARDEN_DIR" 600 || true
 
     if ! docker compose -f "$compose" up -d >> "$LOG_FILE" 2>&1; then
         log_error "Не удалось запустить certwarden-client, подробности: $LOG_FILE"
@@ -2649,6 +2661,7 @@ generate_docker_compose() {
     log "Генерация docker-compose.yml для Remnawave Node..."
 
     mkdir -p "$PROJECT_DIR"
+    chmod 700 "$PROJECT_DIR"   # compose-файл и его копии содержат SECRET_KEY
 
     if [[ -z "$SECRET_KEY" ]]; then
         SECRET_KEY=$(existing_secret_key)
@@ -2717,8 +2730,7 @@ EOF
     [[ -z "$ssl_volume" ]] && sed -i '$ { /^$/d }' "$tmp"
 
     local compose="$PROJECT_DIR/docker-compose.yml"
-    install_config "$tmp" "$compose" "$PROJECT_DIR" || true
-    chmod 600 "$compose"   # в файле SECRET_KEY
+    install_config "$tmp" "$compose" "$PROJECT_DIR" 600 || true   # в файле SECRET_KEY
 
     if [[ "$secret_key" == "REPLACE_WITH_SECRET_KEY_FROM_PANEL" ]]; then
         log_warning "Перед запуском замените SECRET_KEY в $compose и выполните:"
