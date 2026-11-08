@@ -1,0 +1,8 @@
+# Скрипты и шаблоны выполняются и читаются на Linux: CRLF ломает bash
+# ("$'\r': command not found") и попадает в конфиги nginx
+*.sh     text eol=lf
+*.tpl    text eol=lf
+*.html   text eol=lf
+*.json   text eol=lf
+*.py     text eol=lf
+.env*    text eol=lf
